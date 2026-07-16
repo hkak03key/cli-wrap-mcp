@@ -1,0 +1,738 @@
+"""cliwrap: 宣言的 YAML config から CLI ラップ MCP サーバーを動的生成するエンジン。
+
+使い方:
+    cli-wrap-mcp --config <path.yml>
+
+設計原則 (安全性がこの仕組みの核):
+- 実行は常に shell=False の argv 配列。シェル文字列連結の経路は存在しない
+- パラメータ値は検証 (type / pattern fullmatch / enum) を通過してから argv 要素に埋め込む
+- 引数インジェクション対策: `-` で始まる値は既定で拒否 (per-param の
+  allow_dash_prefix = true で明示的に許可可能)
+- config ロード時に argv 内の未定義プレースホルダはエラー
+- stdout は MCP プロトコル専用。ログ・デバッグ出力は必ず stderr へ
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import keyword
+import os
+import re
+import signal
+import string
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+DEFAULT_TIMEOUT_SEC = 60
+DEFAULT_MAX_OUTPUT_BYTES = 50_000
+STDERR_TAIL_BYTES = 2_000
+SPILL_EXCERPT_BYTES = 1_000
+ON_LARGE_OUTPUT_MODES = {"truncate", "spill"}
+
+PARAM_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# エンジンが全 sync ツールに自動注入するパラメータ名 (config での定義は禁止)
+RESERVED_PARAM_NAMES = {"output_dir"}
+
+PY_TYPES: dict[str, type] = {"string": str, "integer": int, "boolean": bool}
+
+
+class ConfigError(Exception):
+    """config が不正なときにロード時に送出する。"""
+
+
+class ParamValidationError(Exception):
+    """ツール呼び出し時のパラメータ検証エラー。"""
+
+
+@dataclass
+class ParamSpec:
+    name: str
+    type: str = "string"
+    description: str = ""
+    required: bool = True
+    pattern: str | None = None
+    enum: list[Any] | None = None
+    default: Any = None
+    allow_dash_prefix: bool = False
+
+    @property
+    def has_default(self) -> bool:
+        return self.default is not None
+
+
+@dataclass
+class ToolSpec:
+    name: str
+    description: str
+    argv: list[str]
+    mode: str = "sync"
+    timeout_sec: int = DEFAULT_TIMEOUT_SEC
+    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+    on_large_output: str = "truncate"
+    params: dict[str, ParamSpec] = field(default_factory=dict)
+
+
+@dataclass
+class ServerSpec:
+    name: str
+    description: str = ""
+    tools: dict[str, ToolSpec] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# config ロード
+# ---------------------------------------------------------------------------
+
+def _placeholders(template: str) -> list[str]:
+    """format テンプレート中のプレースホルダ名を列挙する。
+
+    format spec / conversion / ネストしたフィールドアクセスは安全のため禁止する。
+    """
+    names: list[str] = []
+    for _literal, field_name, format_spec, conversion in string.Formatter().parse(template):
+        if field_name is None:
+            continue
+        if field_name == "":
+            raise ConfigError(f"positional placeholder '{{}}' is not allowed: {template!r}")
+        if format_spec or conversion:
+            raise ConfigError(
+                f"format spec / conversion is not allowed in placeholder: {template!r}"
+            )
+        if "." in field_name or "[" in field_name:
+            raise ConfigError(
+                f"attribute/index access is not allowed in placeholder: {template!r}"
+            )
+        names.append(field_name)
+    return names
+
+
+def _load_param(tool_name: str, pname: str, raw: dict[str, Any]) -> ParamSpec:
+    ctx = f"tools.{tool_name}.params.{pname}"
+    if not isinstance(pname, str) or not PARAM_NAME_RE.match(pname) or keyword.iskeyword(pname):
+        raise ConfigError(f"{ctx}: invalid param name (must match {PARAM_NAME_RE.pattern})")
+    if pname in RESERVED_PARAM_NAMES:
+        raise ConfigError(
+            f"{ctx}: param name {pname!r} is reserved (injected by the engine)"
+        )
+    ptype = raw.get("type", "string")
+    if ptype not in PY_TYPES:
+        raise ConfigError(f"{ctx}: unknown type {ptype!r} (expected one of {sorted(PY_TYPES)})")
+    unknown = set(raw) - {
+        "type", "description", "required", "pattern", "enum", "default", "allow_dash_prefix",
+    }
+    if unknown:
+        raise ConfigError(f"{ctx}: unknown keys {sorted(unknown)}")
+    spec = ParamSpec(
+        name=pname,
+        type=ptype,
+        description=raw.get("description", ""),
+        required=raw.get("required", True),
+        pattern=raw.get("pattern"),
+        enum=raw.get("enum"),
+        default=raw.get("default"),
+        allow_dash_prefix=raw.get("allow_dash_prefix", False),
+    )
+    if spec.pattern is not None:
+        if spec.type != "string":
+            raise ConfigError(f"{ctx}: pattern is only supported for string params")
+        try:
+            re.compile(spec.pattern)
+        except re.error as exc:
+            raise ConfigError(f"{ctx}: invalid pattern: {exc}") from exc
+    py_type = PY_TYPES[spec.type]
+    if spec.enum is not None:
+        for item in spec.enum:
+            if not isinstance(item, py_type) or (py_type is int and isinstance(item, bool)):
+                raise ConfigError(f"{ctx}: enum value {item!r} does not match type {ptype}")
+    if spec.default is not None:
+        if not isinstance(spec.default, py_type) or (
+            py_type is int and isinstance(spec.default, bool)
+        ):
+            raise ConfigError(f"{ctx}: default {spec.default!r} does not match type {ptype}")
+    return spec
+
+
+def _load_tool(raw: dict[str, Any], default_on_large_output: str = "truncate") -> ToolSpec:
+    name = raw.get("name")
+    if not name or not isinstance(name, str) or not TOOL_NAME_RE.match(name):
+        raise ConfigError(f"tools[].name is required and must match {TOOL_NAME_RE.pattern}: {name!r}")
+    ctx = f"tools.{name}"
+    unknown = set(raw) - {
+        "name", "description", "argv", "mode", "timeout_sec", "max_output_bytes",
+        "on_large_output", "params",
+    }
+    if unknown:
+        raise ConfigError(f"{ctx}: unknown keys {sorted(unknown)}")
+    on_large_output = raw.get("on_large_output", default_on_large_output)
+    if on_large_output not in ON_LARGE_OUTPUT_MODES:
+        raise ConfigError(
+            f"{ctx}: on_large_output must be one of {sorted(ON_LARGE_OUTPUT_MODES)}, "
+            f"got {on_large_output!r}"
+        )
+    argv = raw.get("argv")
+    if not argv or not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
+        raise ConfigError(f"{ctx}: argv must be a non-empty list of strings")
+    mode = raw.get("mode", "sync")
+    if mode not in SUPPORTED_MODES:
+        raise ConfigError(f"{ctx}: unknown mode {mode!r} (expected one of {sorted(SUPPORTED_MODES)})")
+    params_raw = raw.get("params") or {}
+    if not isinstance(params_raw, dict) or not all(
+        isinstance(p, dict) for p in params_raw.values()
+    ):
+        raise ConfigError(f"{ctx}: params must be a mapping of param name -> mapping")
+    params = {
+        pname: _load_param(name, pname, praw) for pname, praw in params_raw.items()
+    }
+    tool = ToolSpec(
+        name=name,
+        description=raw.get("description", ""),
+        argv=list(argv),
+        mode=mode,
+        timeout_sec=raw.get("timeout_sec", DEFAULT_TIMEOUT_SEC),
+        max_output_bytes=raw.get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES),
+        on_large_output=on_large_output,
+        params=params,
+    )
+
+    referenced: set[str] = set()
+    for element in tool.argv:
+        try:
+            referenced.update(_placeholders(element))
+        except ConfigError as exc:
+            raise ConfigError(f"{ctx}: {exc}") from exc
+    undefined = referenced - set(params)
+    if undefined:
+        raise ConfigError(f"{ctx}: undefined placeholders in argv: {sorted(undefined)}")
+    for pname in sorted(set(params) - referenced):
+        print(f"cliwrap: warning: {ctx}: param {pname!r} is never used in argv", file=sys.stderr)
+    # 省略可能 (required=false) かつ default なしのパラメータは argv を組めないので禁止する
+    for pname in sorted(referenced):
+        spec = params[pname]
+        if not spec.required and not spec.has_default:
+            raise ConfigError(
+                f"{ctx}: param {pname!r} is optional but has no default; "
+                "argv rendering would be undefined"
+            )
+    return tool
+
+
+def load_config(path: str | Path) -> ServerSpec:
+    with open(path, encoding="utf-8") as fp:
+        raw = yaml.safe_load(fp)
+    if not isinstance(raw, dict):
+        raise ConfigError("config must be a YAML mapping")
+    server_raw = raw.get("server")
+    if not isinstance(server_raw, dict) or not server_raw.get("name"):
+        raise ConfigError("'server' section with name is required")
+    server = ServerSpec(
+        name=server_raw["name"],
+        description=server_raw.get("description", ""),
+    )
+    defaults_raw = raw.get("defaults") or {}
+    if not isinstance(defaults_raw, dict):
+        raise ConfigError("'defaults' must be a mapping")
+    unknown_defaults = set(defaults_raw) - {"on_large_output"}
+    if unknown_defaults:
+        raise ConfigError(f"defaults: unknown keys {sorted(unknown_defaults)}")
+    default_olo = defaults_raw.get("on_large_output", "truncate")
+    if default_olo not in ON_LARGE_OUTPUT_MODES:
+        raise ConfigError(
+            f"defaults.on_large_output must be one of {sorted(ON_LARGE_OUTPUT_MODES)}, "
+            f"got {default_olo!r}"
+        )
+    tools_raw = raw.get("tools") or []
+    if not isinstance(tools_raw, list):
+        raise ConfigError("'tools' must be a list")
+    for tool_raw in tools_raw:
+        if not isinstance(tool_raw, dict):
+            raise ConfigError("each tools entry must be a mapping")
+        tool = _load_tool(tool_raw, default_on_large_output=default_olo)
+        if tool.name in server.tools:
+            raise ConfigError(f"duplicate tool name: {tool.name}")
+        server.tools[tool.name] = tool
+    if not server.tools:
+        raise ConfigError("at least one tools entry is required")
+    # MCP に実際に登録される名前 (job は _start 等を生成) の衝突をロード時に検出する
+    exposed: set[str] = set()
+    for tool in server.tools.values():
+        if tool.mode == "job":
+            names = [f"{tool.name}_{suffix}" for suffix in ("start", "status", "result", "cancel")]
+        else:
+            names = [tool.name]
+        for n in names:
+            if n in exposed:
+                raise ConfigError(f"exposed tool name collision: {n!r}")
+            exposed.add(n)
+    return server
+
+
+# ---------------------------------------------------------------------------
+# パラメータ検証と argv レンダリング
+# ---------------------------------------------------------------------------
+
+def validate_param(spec: ParamSpec, value: Any) -> str:
+    """値を検証し、argv 要素に埋め込む文字列表現を返す。"""
+    py_type = PY_TYPES[spec.type]
+    if not isinstance(value, py_type) or (py_type is int and isinstance(value, bool)):
+        raise ParamValidationError(
+            f"param {spec.name!r}: expected {spec.type}, got {type(value).__name__}"
+        )
+    if spec.enum is not None and value not in spec.enum:
+        raise ParamValidationError(
+            f"param {spec.name!r}: value {value!r} is not in enum {spec.enum}"
+        )
+    if spec.pattern is not None and not re.fullmatch(spec.pattern, value):
+        raise ParamValidationError(
+            f"param {spec.name!r}: value {value!r} does not match pattern {spec.pattern!r}"
+        )
+    if spec.type == "boolean":
+        rendered = "true" if value else "false"
+    else:
+        rendered = str(value)
+    # 引数インジェクション対策: `-` 始まりの値はオプションとして解釈されうるので既定で拒否
+    if rendered.startswith("-") and not spec.allow_dash_prefix:
+        raise ParamValidationError(
+            f"param {spec.name!r}: value starting with '-' is rejected "
+            "(set allow_dash_prefix = true in config to allow)"
+        )
+    return rendered
+
+
+def render_argv(tool: ToolSpec, arguments: dict[str, Any]) -> list[str]:
+    """検証済みパラメータで argv テンプレートを埋め、実行可能な argv を返す。"""
+    rendered_params: dict[str, str] = {}
+    for pname, spec in tool.params.items():
+        if pname in arguments and arguments[pname] is not None:
+            value = arguments[pname]
+        elif spec.has_default:
+            value = spec.default
+        elif spec.required:
+            raise ParamValidationError(f"param {pname!r} is required")
+        else:
+            continue  # 未参照の optional (ロード時に argv 参照は禁止済み)
+        rendered_params[pname] = validate_param(spec, value)
+
+    argv: list[str] = []
+    for element in tool.argv:
+        names = _placeholders(element)
+        if not names:
+            argv.append(element)
+            continue
+        argv.append(element.format(**{n: rendered_params[n] for n in names}))
+    return argv
+
+
+# ---------------------------------------------------------------------------
+# sync 実行
+# ---------------------------------------------------------------------------
+
+def _truncate(data: bytes, limit: int) -> str:
+    text = data.decode("utf-8", errors="replace")
+    if len(data) <= limit:
+        return text
+    truncated = data[:limit].decode("utf-8", errors="replace")
+    return f"{truncated}\n[cliwrap: output truncated at {limit} bytes (total {len(data)} bytes)]"
+
+
+def _write_output_file(tool: ToolSpec, data: bytes, out_dir: Path) -> Path:
+    """stdout 全量を <out_dir>/<tool>-<id>.out に書く (OSError は呼び出し側で処理)。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    path = out_dir / f"{tool.name}-{name}.out"
+    path.write_bytes(data)
+    return path
+
+
+def _file_reply(data: bytes, path: Path, reason: str = "") -> str:
+    """全量ファイルへの参照+抜粋だけを返す (呼び出し側 context の節約)。"""
+    head = data[:SPILL_EXCERPT_BYTES].decode("utf-8", errors="replace")
+    tail = data[-SPILL_EXCERPT_BYTES:].decode("utf-8", errors="replace")
+    return (
+        f"[cliwrap: output is {len(data)} bytes{reason}; full output saved to file]\n"
+        f"file: {path}\n"
+        f"Do not read it whole: use Read with offset/limit, or grep, to inspect parts.\n"
+        f"--- head ({SPILL_EXCERPT_BYTES} bytes) ---\n{head}\n"
+        f"--- tail ({SPILL_EXCERPT_BYTES} bytes) ---\n{tail}"
+    )
+
+
+def _spill_output(tool: ToolSpec, data: bytes, spill_dir: Path) -> str:
+    try:
+        path = _write_output_file(tool, data, spill_dir)
+    except OSError as exc:
+        print(f"cliwrap: spill failed ({exc}); falling back to truncate", file=sys.stderr)
+        return _truncate(data, tool.max_output_bytes)
+    return _file_reply(data, path, reason=f" (> {tool.max_output_bytes})")
+
+
+def run_sync(
+    tool: ToolSpec,
+    argv: list[str],
+    spill_dir: Path | None = None,
+    output_dir: Path | None = None,
+) -> str:
+    try:
+        proc = subprocess.run(
+            argv,
+            shell=False,
+            capture_output=True,
+            timeout=tool.timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        return f"error: command timed out after {tool.timeout_sec}s: {argv!r}"
+    except OSError as exc:
+        return f"error: failed to execute {argv!r}: {exc}"
+    if proc.returncode != 0:
+        stderr_tail = proc.stderr[-STDERR_TAIL_BYTES:].decode("utf-8", errors="replace")
+        return (
+            f"error: command exited with code {proc.returncode}\n"
+            f"stderr (tail):\n{stderr_tail}"
+        )
+    if output_dir is not None:
+        # 呼び出し側が明示した保存先へ、サイズに関係なく必ず全量を書く
+        try:
+            path = _write_output_file(tool, proc.stdout, output_dir)
+        except OSError as exc:
+            return f"error: failed to write output to {output_dir}: {exc}"
+        return _file_reply(proc.stdout, path)
+    if (
+        len(proc.stdout) > tool.max_output_bytes
+        and tool.on_large_output == "spill"
+        and spill_dir is not None
+    ):
+        return _spill_output(tool, proc.stdout, spill_dir)
+    return _truncate(proc.stdout, tool.max_output_bytes)
+
+
+# ---------------------------------------------------------------------------
+# job モード (長時間 CLI の非同期実行)
+# ---------------------------------------------------------------------------
+
+JOB_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{6}$")
+
+
+def default_cache_dir() -> Path:
+    env = os.environ.get("CLI_MCP_CACHE_DIR")
+    return Path(env) if env else Path.home() / ".cache" / "cli-mcp"
+
+
+def _tail_file(path: Path, limit: int) -> str:
+    try:
+        with open(path, "rb") as fp:
+            fp.seek(0, os.SEEK_END)
+            size = fp.tell()
+            fp.seek(max(0, size - limit))
+            data = fp.read()
+    except OSError:
+        return ""
+    prefix = "...(truncated)...\n" if size > limit else ""
+    return prefix + data.decode("utf-8", errors="replace")
+
+
+class JobManager:
+    """job モードの状態管理 (MVP)。
+
+    サーバープロセス内の Popen 管理を主とし、出力・pid・メタ情報は
+    <cache_dir>/<server>/jobs/<job_id>/ のファイルに残す。サーバー再起動後の
+    孤児 job は best-effort (pid 生存確認と exit_code ファイル) でのみ参照できる。
+    """
+
+    def __init__(self, server_name: str, cache_dir: Path | None = None):
+        self.jobs_dir = (cache_dir or default_cache_dir()) / server_name / "jobs"
+        self._procs: dict[str, subprocess.Popen] = {}
+
+    def _job_dir(self, job_id: str) -> Path:
+        # job_id は client 入力なので、パストラバーサルを形式検証で遮断する
+        if not JOB_ID_RE.match(job_id):
+            raise ParamValidationError(f"invalid job_id: {job_id!r}")
+        return self.jobs_dir / job_id
+
+    def start(self, tool: ToolSpec, argv: list[str]) -> str:
+        job_id = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        jdir = self.jobs_dir / job_id
+        jdir.mkdir(parents=True)
+        with open(jdir / "stdout.log", "wb") as out_fp, open(jdir / "stderr.log", "wb") as err_fp:
+            try:
+                proc = subprocess.Popen(
+                    argv,
+                    shell=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=out_fp,
+                    stderr=err_fp,
+                    start_new_session=True,  # cancel で process group ごと止めるため
+                )
+            except OSError as exc:
+                return f"error: failed to start {argv!r}: {exc}"
+        (jdir / "pid").write_text(str(proc.pid), encoding="utf-8")
+        meta = {
+            "tool": tool.name,
+            "argv": argv,
+            "pid": proc.pid,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        (jdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        self._procs[job_id] = proc
+        print(f"cliwrap: job {job_id} started: {argv!r}", file=sys.stderr)
+        return (
+            f"job started: {job_id}\n"
+            f"logs: {jdir}\n"
+            f"use {tool.name}_status / {tool.name}_result / {tool.name}_cancel with this job_id"
+        )
+
+    def _poll(self, job_id: str) -> tuple[str, int | None]:
+        """('running' | 'exited' | 'unknown', exit_code) を返す。"""
+        jdir = self._job_dir(job_id)
+        proc = self._procs.get(job_id)
+        if proc is not None:
+            rc = proc.poll()
+            if rc is None:
+                return "running", None
+            exit_file = jdir / "exit_code"
+            if not exit_file.exists():
+                exit_file.write_text(str(rc), encoding="utf-8")
+            return "exited", rc
+        # fallback: サーバー再起動などでプロセスハンドルを失った job (best-effort)
+        if not jdir.is_dir():
+            raise ParamValidationError(f"unknown job_id: {job_id!r}")
+        exit_file = jdir / "exit_code"
+        if exit_file.exists():
+            return "exited", int(exit_file.read_text())
+        try:
+            pid = int((jdir / "pid").read_text())
+            os.kill(pid, 0)
+            return "running", None
+        except (OSError, ValueError):
+            return "unknown", None
+
+    def status(self, job_id: str, tail_bytes: int = 2_000) -> str:
+        state, rc = self._poll(job_id)
+        jdir = self._job_dir(job_id)
+        lines = [f"job {job_id}: {state}" + (f" (exit code {rc})" if rc is not None else "")]
+        if state == "unknown":
+            lines.append(
+                "(process handle lost and no exit code recorded; "
+                "the server may have restarted while the job was running)"
+            )
+        stdout_tail = _tail_file(jdir / "stdout.log", tail_bytes)
+        stderr_tail = _tail_file(jdir / "stderr.log", tail_bytes)
+        lines.append(f"stdout (tail):\n{stdout_tail or '(empty)'}")
+        if stderr_tail:
+            lines.append(f"stderr (tail):\n{stderr_tail}")
+        return "\n".join(lines)
+
+    def result(self, job_id: str, max_bytes: int) -> str:
+        state, rc = self._poll(job_id)
+        if state == "running":
+            return f"job {job_id} is still running; try again later (or check _status)"
+        jdir = self._job_dir(job_id)
+        header = f"job {job_id}: {state}" + (f" (exit code {rc})" if rc is not None else "")
+        stdout = _tail_file(jdir / "stdout.log", max_bytes) or "(empty)"
+        parts = [header, f"stdout:\n{stdout}"]
+        if rc not in (0, None):
+            parts.append(f"stderr (tail):\n{_tail_file(jdir / 'stderr.log', STDERR_TAIL_BYTES)}")
+        return "\n".join(parts)
+
+    def cancel(self, job_id: str) -> str:
+        state, rc = self._poll(job_id)
+        if state == "exited":
+            return f"job {job_id} already exited (exit code {rc})"
+        jdir = self._job_dir(job_id)
+        try:
+            pid = int((jdir / "pid").read_text())
+        except (OSError, ValueError) as exc:
+            return f"error: cannot read pid for job {job_id}: {exc}"
+        try:
+            # start_new_session で起動しているので pid == pgid。グループごと止める
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return f"job {job_id} is not running (process already gone)"
+        except OSError as exc:
+            return f"error: failed to terminate job {job_id}: {exc}"
+        return f"job {job_id}: SIGTERM sent to process group {pid}"
+
+
+# ---------------------------------------------------------------------------
+# MCP サーバー組み立て
+# ---------------------------------------------------------------------------
+
+def _make_tool_fn(fn_name: str, tool: ToolSpec, invoke, inject_output_dir: bool = False):
+    """config のパラメータ定義から、FastMCP がスキーマ推論できる関数を生成する。
+
+    FastMCP は関数シグネチャから inputSchema を作るため、exec で実シグネチャを持つ
+    関数を組み立てる。パラメータ名は config ロード時に識別子として検証済み。
+    inject_output_dir=True で予約パラメータ output_dir (optional) を注入する。
+    """
+    required_args: list[str] = []
+    optional_args: list[str] = []
+    for pname, spec in tool.params.items():
+        ann = PY_TYPES[spec.type].__name__
+        if spec.has_default or not spec.required:
+            optional_args.append(f"{pname}: {ann} = {spec.default!r}")
+        else:
+            required_args.append(f"{pname}: {ann}")
+    if inject_output_dir:
+        optional_args.append("output_dir: str | None = None")
+    signature = ", ".join(required_args + optional_args)
+    src = (
+        f"def {fn_name}({signature}) -> str:\n"
+        f"    kwargs = dict(locals())\n"
+        f"    return _invoke(kwargs)\n"
+    )
+    namespace: dict[str, Any] = {"_invoke": invoke}
+    exec(src, namespace)  # noqa: S102 - config は信頼済みローカルファイル
+    return namespace[fn_name]
+
+
+def build_server(spec: ServerSpec, cache_dir: Path | None = None):
+    from mcp.server.fastmcp import FastMCP
+
+    mcp = FastMCP(spec.name, instructions=spec.description)
+    server_cache_dir = (cache_dir or default_cache_dir()) / spec.name
+    spill_dir = server_cache_dir / "outputs"
+    jobs: JobManager | None = None
+    if any(tool.mode == "job" for tool in spec.tools.values()):
+        jobs = JobManager(spec.name, cache_dir=cache_dir)
+    for tool in spec.tools.values():
+        register_tool(mcp, spec, tool, jobs, spill_dir)
+    return mcp
+
+
+def register_tool(
+    mcp,
+    server_spec: ServerSpec,
+    tool: ToolSpec,
+    jobs: JobManager | None,
+    spill_dir: Path | None = None,
+) -> None:
+    if tool.mode == "sync":
+        def invoke(arguments: dict[str, Any], _tool=tool) -> str:
+            output_dir_arg = arguments.pop("output_dir", None)
+            output_dir: Path | None = None
+            if output_dir_arg is not None:
+                if not str(output_dir_arg).startswith("/"):
+                    return "error: output_dir must be an absolute path (starting with '/')"
+                output_dir = Path(output_dir_arg)
+            try:
+                argv = render_argv(_tool, arguments)
+            except ParamValidationError as exc:
+                return f"error: {exc}"
+            print(f"cliwrap: exec {argv!r}", file=sys.stderr)
+            return run_sync(_tool, argv, spill_dir=spill_dir, output_dir=output_dir)
+
+        fn = _make_tool_fn(f"tool_{tool.name}", tool, invoke, inject_output_dir=True)
+        description = (
+            _tool_description(tool)
+            + "\n- output_dir (string, optional) — absolute directory path; if set, "
+            "the full stdout is always written to a file there (regardless of size) "
+            "and only the file path + excerpts are returned"
+        )
+        mcp.add_tool(fn, name=tool.name, description=description)
+    elif tool.mode == "job":
+        assert jobs is not None
+        register_job_tool(mcp, tool, jobs)
+    else:  # pragma: no cover - モードはロード時に検証済み
+        raise ConfigError(f"unsupported mode: {tool.mode}")
+
+
+def register_job_tool(mcp, tool: ToolSpec, jobs: JobManager) -> None:
+    """job モードのツール一式 (<name>_start/_status/_result/_cancel) を登録する。"""
+
+    def invoke_start(arguments: dict[str, Any], _tool=tool) -> str:
+        try:
+            argv = render_argv(_tool, arguments)
+        except ParamValidationError as exc:
+            return f"error: {exc}"
+        return jobs.start(_tool, argv)
+
+    start_fn = _make_tool_fn(f"tool_{tool.name}_start", tool, invoke_start)
+    mcp.add_tool(
+        start_fn,
+        name=f"{tool.name}_start",
+        description=_tool_description(tool)
+        + "\nStarts the command as a background job and returns a job_id immediately.",
+    )
+
+    def status_fn(job_id: str) -> str:
+        try:
+            return jobs.status(job_id)
+        except ParamValidationError as exc:
+            return f"error: {exc}"
+
+    def result_fn(job_id: str) -> str:
+        try:
+            return jobs.result(job_id, tool.max_output_bytes)
+        except ParamValidationError as exc:
+            return f"error: {exc}"
+
+    def cancel_fn(job_id: str) -> str:
+        try:
+            return jobs.cancel(job_id)
+        except ParamValidationError as exc:
+            return f"error: {exc}"
+
+    mcp.add_tool(
+        status_fn,
+        name=f"{tool.name}_status",
+        description=f"Check a background job started by {tool.name}_start: "
+        "running/exited state plus stdout/stderr tail.",
+    )
+    mcp.add_tool(
+        result_fn,
+        name=f"{tool.name}_result",
+        description=f"Fetch the output of a finished job started by {tool.name}_start "
+        "(tail-limited). Returns a notice if the job is still running.",
+    )
+    mcp.add_tool(
+        cancel_fn,
+        name=f"{tool.name}_cancel",
+        description=f"Cancel a running job started by {tool.name}_start "
+        "(SIGTERM to the process group).",
+    )
+
+
+def _tool_description(tool: ToolSpec) -> str:
+    lines = [tool.description or tool.name]
+    for pname, spec in tool.params.items():
+        parts = [spec.type]
+        if not spec.required or spec.has_default:
+            parts.append(f"optional, default={spec.default!r}")
+        if spec.enum is not None:
+            parts.append(f"enum={spec.enum}")
+        desc = f" — {spec.description}" if spec.description else ""
+        lines.append(f"- {pname} ({', '.join(parts)}){desc}")
+    return "\n".join(lines)
+
+
+SUPPORTED_MODES = {"sync", "job"}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", required=True, help="YAML config path (.yml/.yaml)")
+    args = parser.parse_args(argv)
+    try:
+        spec = load_config(args.config)
+    except (ConfigError, OSError, yaml.YAMLError) as exc:
+        print(f"cliwrap: config error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"cliwrap: starting MCP server {spec.name!r} with tools: {sorted(spec.tools)}",
+        file=sys.stderr,
+    )
+    server = build_server(spec)
+    server.run()  # stdio transport (stdout はプロトコル専用)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

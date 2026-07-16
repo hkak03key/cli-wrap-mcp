@@ -1,0 +1,42 @@
+[project]
+name = "cli-wrap-mcp"
+version = "0.1.0"
+description = "Turn any CLI into an MCP server with a declarative YAML config"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "hkak03key" }]
+requires-python = ">=3.11"
+dependencies = [
+    "mcp==1.28.1",
+    "pyyaml==6.0.3",
+]
+keywords = ["mcp", "cli", "llm", "agent", "yaml", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://github.com/hkak03key/cli-wrap-mcp"
+Repository = "https://github.com/hkak03key/cli-wrap-mcp"
+Issues = "https://github.com/hkak03key/cli-wrap-mcp/issues"
+
+[project.scripts]
+cli-wrap-mcp = "cli_wrap_mcp.cliwrap:main"
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
