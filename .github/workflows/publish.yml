@@ -1,0 +1,50 @@
+# Publishes to PyPI via Trusted Publishing (OIDC) when a GitHub Release is published.
+#
+# PyPI side (one-time): register a trusted publisher for project `cli-wrap-mcp`
+# with owner=hkak03key, repository=cli-wrap-mcp, workflow=publish.yml, environment=pypi.
+#
+# Build and publish are separate jobs so that the OIDC credential
+# (id-token: write) is never exposed to the build step.
+name: publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+
+      - name: Build sdist and wheel
+        run: uv build --no-sources
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: upload release to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Mandatory for Trusted Publishing (OIDC). Kept at job level to limit exposure.
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

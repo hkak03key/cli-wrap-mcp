@@ -1,0 +1,21 @@
+# Minimal example: wraps `echo` and `date` as MCP tools.
+#
+# Run:
+#   cli-wrap-mcp --config examples/echo.yml
+server:
+  name: echo-demo
+  description: Minimal cli-wrap-mcp demo (echo / date).
+
+tools:
+  - name: say
+    description: Echo a message back.
+    argv: ["echo", "{message}"]
+    params:
+      message:
+        type: string
+        description: Message to echo.
+        pattern: "[A-Za-z0-9 .,!?_-]{1,200}"
+
+  - name: now
+    description: Print the current UTC date/time.
+    argv: ["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"]

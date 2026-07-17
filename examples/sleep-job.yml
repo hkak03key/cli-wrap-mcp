@@ -1,0 +1,20 @@
+# Job-mode example: runs a long command in the background.
+# `mode: job` exposes four tools: nap_start / nap_status / nap_result / nap_cancel.
+#
+# Run:
+#   cli-wrap-mcp --config examples/sleep-job.yml
+server:
+  name: job-demo
+  description: cli-wrap-mcp job-mode demo (background sleep).
+
+tools:
+  - name: nap
+    description: Sleep for a number of seconds in the background.
+    mode: job
+    argv: ["sleep", "{seconds}"]
+    params:
+      seconds:
+        type: integer
+        description: Seconds to sleep.
+        required: false
+        default: 5
