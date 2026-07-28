@@ -143,13 +143,31 @@ Per parameter (`params.<name>`):
 
 | Key | Required | Default | Description |
 |:----|:---------|:--------|:------------|
-| `type` | no | `string` | `string`, `integer`, or `boolean` (booleans render as `true`/`false`). |
+| `type` | no | `string` | `string`, `integer`, `boolean` (booleans render as `true`/`false`), or `array` (list of strings, see below). |
 | `description` | no | `""` | Shown in the tool schema. |
-| `required` | no | `true` | Optional parameters must have a `default` if referenced in argv. |
-| `pattern` | no | — | Regex, string params only, matched with `fullmatch`. |
-| `enum` | no | — | Allowed values (type-checked at load time). |
+| `required` | no | `true` | Optional parameters must have a `default` if referenced in argv (optional arrays implicitly default to `[]`). |
+| `pattern` | no | — | Regex allowlist, string/array params, matched with `fullmatch` (per item for arrays). |
+| `deny_pattern` | no | — | Regex blocklist, string/array params: a value that `fullmatch`es is rejected (per item for arrays). Combine with `allow_dash_prefix: true` to allow flags in general while blocking specific ones. |
+| `enum` | no | — | Allowed values (type-checked at load time; string items for arrays). |
 | `default` | no | — | Used when the argument is omitted (type-checked at load time). |
-| `allow_dash_prefix` | no | `false` | Permit values starting with `-` (off by default; injection guard). |
+| `allow_dash_prefix` | no | `false` | Permit values starting with `-` (off by default; injection guard). Applies per item for arrays. |
+
+### Array (variadic) parameters
+
+`type: array` accepts a list of strings and expands into that many argv elements —
+use it to pass a variable-length subcommand tail (`gcloud {args}`). Rules:
+
+- The placeholder must be an **entire argv element** (`"{args}"`); embedding it in a
+  larger element (`"--x={args}"`) is a load-time error, because the expansion would
+  collapse into one element and change meaning.
+- `pattern`, `deny_pattern`, `enum`, and the dash-prefix guard are applied to
+  **each item** individually; every item stays exactly one argv element (no shell,
+  no word splitting).
+- An empty list expands to zero elements. Optional arrays default to `[]` unless an
+  explicit `default` is given.
+- Fixed argv elements placed *after* the placeholder still apply, which lets a config
+  force trailing flags that override anything the model passed earlier (for
+  argparse-style CLIs the last occurrence of a flag wins).
 
 Parameter names must match `[a-z_][a-z0-9_]*` and must not be Python keywords.
 `output_dir` is **reserved**: the engine injects it into every sync tool as an

@@ -164,6 +164,96 @@ class LoadConfigTest(unittest.TestCase):
             )
 
 
+class ArrayConfigTest(unittest.TestCase):
+    def test_array_param_loads(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: run\n'
+            '    argv: ["gcloud", "{args}"]\n'
+            '    params:\n'
+            '      args:\n'
+            '        type: array\n'
+            '        allow_dash_prefix: true\n'
+            '        deny_pattern: "--project(=.*)?"\n'
+        )
+        p = spec.tools["run"].params["args"]
+        self.assertEqual("array", p.type)
+        self.assertEqual("--project(=.*)?", p.deny_pattern)
+
+    def test_embedded_array_placeholder_is_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "entire argv element"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: run\n'
+                '    argv: ["gcloud", "--flags={args}"]\n'
+                '    params: {args: {type: array}}\n'
+            )
+
+    def test_array_placeholder_mixed_with_literal_is_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "entire argv element"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: run\n'
+                '    argv: ["gcloud", "{sub}{args}"]\n'
+                '    params:\n'
+                '      sub: {type: string}\n'
+                '      args: {type: array}\n'
+            )
+
+    def test_optional_array_gets_empty_default(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: run\n'
+            '    argv: ["ls", "{args}"]\n'
+            '    params: {args: {type: array, required: false}}\n'
+        )
+        self.assertEqual([], spec.tools["run"].params["args"].default)
+
+    def test_array_default_must_be_string_list(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "list of strings"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: run\n'
+                '    argv: ["ls", "{args}"]\n'
+                '    params: {args: {type: array, default: [1, 2]}}\n'
+            )
+
+    def test_array_enum_items_must_be_strings(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "must be strings"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: run\n'
+                '    argv: ["ls", "{args}"]\n'
+                '    params: {args: {type: array, enum: [1]}}\n'
+            )
+
+    def test_invalid_deny_pattern_is_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "invalid deny_pattern"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: x\n'
+                '    argv: ["echo", "{m}"]\n'
+                '    params: {m: {type: string, deny_pattern: "["}}\n'
+            )
+
+    def test_deny_pattern_on_integer_is_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "only supported for string/array"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: x\n'
+                '    argv: ["echo", "{n}"]\n'
+                '    params: {n: {type: integer, deny_pattern: "-1"}}\n'
+            )
+
+
 class ValidateParamTest(unittest.TestCase):
     def spec(self, **kwargs) -> cliwrap.ParamSpec:
         return cliwrap.ParamSpec(name="p", **kwargs)
@@ -211,6 +301,65 @@ class ValidateParamTest(unittest.TestCase):
     def test_dash_prefix_allowed_when_opted_in(self):
         spec = self.spec(type="string", allow_dash_prefix=True)
         self.assertEqual("--help", cliwrap.validate_param(spec, "--help"))
+
+    # --- deny_pattern (blocklist) ---------------------------------------
+
+    def test_deny_pattern_rejects_fullmatch_only(self):
+        spec = self.spec(type="string", deny_pattern=r"forbidden")
+        with self.assertRaisesRegex(cliwrap.ParamValidationError, "denied by deny_pattern"):
+            cliwrap.validate_param(spec, "forbidden")
+        # 部分一致は拒否しない (fullmatch)
+        self.assertEqual("forbidden-ish", cliwrap.validate_param(spec, "forbidden-ish"))
+
+    # --- array param -----------------------------------------------------
+
+    def test_array_returns_item_list(self):
+        spec = self.spec(type="array")
+        self.assertEqual(
+            ["compute", "instances", "list"],
+            cliwrap.validate_param(spec, ["compute", "instances", "list"]),
+        )
+        self.assertEqual([], cliwrap.validate_param(spec, []))
+
+    def test_array_rejects_non_list(self):
+        with self.assertRaisesRegex(cliwrap.ParamValidationError, "expected array"):
+            cliwrap.validate_param(self.spec(type="array"), "compute instances list")
+
+    def test_array_rejects_non_string_item(self):
+        with self.assertRaisesRegex(cliwrap.ParamValidationError, r"'p'\[1\].*expected string"):
+            cliwrap.validate_param(self.spec(type="array"), ["ok", 42])
+
+    def test_array_item_pattern_fullmatch(self):
+        spec = self.spec(type="array", pattern=r"[a-z-]+")
+        self.assertEqual(["a", "b-c"], cliwrap.validate_param(spec, ["a", "b-c"]))
+        with self.assertRaisesRegex(cliwrap.ParamValidationError, "does not match pattern"):
+            cliwrap.validate_param(spec, ["ok", "not ok"])
+
+    def test_array_item_dash_guard_and_opt_in(self):
+        with self.assertRaisesRegex(cliwrap.ParamValidationError, "starting with '-'"):
+            cliwrap.validate_param(self.spec(type="array"), ["--force"])
+        spec = self.spec(type="array", allow_dash_prefix=True)
+        self.assertEqual(["--force"], cliwrap.validate_param(spec, ["--force"]))
+
+    def test_array_item_deny_pattern(self):
+        spec = self.spec(
+            type="array",
+            allow_dash_prefix=True,
+            deny_pattern=r"--(project|flags-file)(=.*)?",
+        )
+        self.assertEqual(
+            ["compute", "--zone=asia-northeast1-a"],
+            cliwrap.validate_param(spec, ["compute", "--zone=asia-northeast1-a"]),
+        )
+        for bad in ("--project", "--project=other", "--flags-file=/tmp/x.yml"):
+            with self.assertRaisesRegex(cliwrap.ParamValidationError, "denied by deny_pattern"):
+                cliwrap.validate_param(spec, [bad])
+
+    def test_array_item_enum(self):
+        spec = self.spec(type="array", enum=["a", "b"])
+        self.assertEqual(["a", "b"], cliwrap.validate_param(spec, ["a", "b"]))
+        with self.assertRaisesRegex(cliwrap.ParamValidationError, "not in enum"):
+            cliwrap.validate_param(spec, ["c"])
 
 
 class RenderArgvTest(unittest.TestCase):
@@ -275,6 +424,50 @@ class RenderArgvTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(cliwrap.ParamValidationError, "starting with '-'"):
             cliwrap.render_argv(tool, {"number": "--web"})
+
+    def test_array_expands_with_forced_flag_after(self):
+        tool = self.tool(
+            ["gcloud", "{args}", "--project=pinned"],
+            args=cliwrap.ParamSpec(name="args", type="array"),
+        )
+        self.assertEqual(
+            ["gcloud", "compute", "instances", "list", "--project=pinned"],
+            cliwrap.render_argv(tool, {"args": ["compute", "instances", "list"]}),
+        )
+
+    def test_empty_array_expands_to_zero_elements(self):
+        tool = self.tool(
+            ["ls", "{args}"],
+            args=cliwrap.ParamSpec(name="args", type="array", required=False, default=[]),
+        )
+        self.assertEqual(["ls"], cliwrap.render_argv(tool, {}))
+
+    def test_array_item_with_spaces_stays_single_element(self):
+        tool = self.tool(
+            ["echo", "{args}"],
+            args=cliwrap.ParamSpec(name="args", type="array"),
+        )
+        self.assertEqual(
+            ["echo", "a b; rm -rf /"],
+            cliwrap.render_argv(tool, {"args": ["a b; rm -rf /"]}),
+        )
+
+    def test_missing_required_array_is_error(self):
+        tool = self.tool(
+            ["ls", "{args}"],
+            args=cliwrap.ParamSpec(name="args", type="array"),
+        )
+        with self.assertRaisesRegex(cliwrap.ParamValidationError, "required"):
+            cliwrap.render_argv(tool, {})
+
+    def test_array_in_non_exact_element_rejected_at_render(self):
+        # ロード時検証を通らない ToolSpec 直組みへの防御
+        tool = self.tool(
+            ["echo", "--x={args}"],
+            args=cliwrap.ParamSpec(name="args", type="array"),
+        )
+        with self.assertRaisesRegex(cliwrap.ParamValidationError, "entire argv element"):
+            cliwrap.render_argv(tool, {"args": ["v"]})
 
     def test_multiple_placeholders_in_one_element(self):
         tool = self.tool(
@@ -730,6 +923,20 @@ class JobConfigTest(unittest.TestCase):
             ["task_cancel", "task_result", "task_start", "task_status"], names,
         )
 
+    def test_job_tool_with_array_param_loads_and_renders(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: task\n'
+            '    mode: job\n'
+            '    argv: ["do-work", "{args}"]\n'
+            '    params: {args: {type: array}}\n'
+        )
+        self.assertEqual(
+            ["do-work", "a", "b"],
+            cliwrap.render_argv(spec.tools["task"], {"args": ["a", "b"]}),
+        )
+
     def test_exposed_name_collision_is_error(self):
         with self.assertRaisesRegex(cliwrap.ConfigError, "collision"):
             load_yaml(
@@ -768,6 +975,45 @@ class BuildServerTest(unittest.TestCase):
         result = anyio.run(lambda: server.call_tool("pyprint", {"msg": "ping"}))
         content = result[0] if isinstance(result, tuple) else result
         self.assertIn("ok:ping", content[0].text)
+
+    ARRAY_YAML = (
+        'server: {name: t}\n'
+        'tools:\n'
+        '  - name: pyargs\n'
+        '    description: print argv\n'
+        f'    argv: ["{sys.executable}", "-c", "import sys; print(sys.argv[1:])", "{{args}}"]\n'
+        '    params:\n'
+        '      args: {type: array, required: false}\n'
+    )
+
+    def test_array_param_in_input_schema(self):
+        server = cliwrap.build_server(load_yaml(self.ARRAY_YAML))
+        import anyio
+
+        schema = anyio.run(server.list_tools)[0].inputSchema
+        self.assertNotIn("args", schema.get("required", []))
+        prop = schema["properties"]["args"]
+        # optional array は list[str] | None なので anyOf 形になる
+        variants = prop.get("anyOf", [prop])
+        array_variants = [v for v in variants if v.get("type") == "array"]
+        self.assertEqual(1, len(array_variants))
+        self.assertEqual({"type": "string"}, array_variants[0]["items"])
+
+    def test_call_tool_with_array_argument(self):
+        server = cliwrap.build_server(load_yaml(self.ARRAY_YAML))
+        import anyio
+
+        result = anyio.run(lambda: server.call_tool("pyargs", {"args": ["a", "b c"]}))
+        content = result[0] if isinstance(result, tuple) else result
+        self.assertIn("['a', 'b c']", content[0].text)
+
+    def test_call_tool_with_array_omitted_uses_empty_default(self):
+        server = cliwrap.build_server(load_yaml(self.ARRAY_YAML))
+        import anyio
+
+        result = anyio.run(lambda: server.call_tool("pyargs", {}))
+        content = result[0] if isinstance(result, tuple) else result
+        self.assertIn("[]", content[0].text)
 
 
 if __name__ == "__main__":
