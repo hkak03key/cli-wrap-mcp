@@ -404,6 +404,134 @@ class SpillConfigTest(unittest.TestCase):
                 '  - {name: x, argv: ["true"]}\n'
             )
 
+class EnvConfigTest(unittest.TestCase):
+    def test_tool_env_loads(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: x\n'
+            '    argv: ["true"]\n'
+            '    env: {FOO: bar}\n'
+        )
+        self.assertEqual({"FOO": "bar"}, spec.tools["x"].env)
+
+    def test_defaults_env_merged_and_tool_wins(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'defaults:\n'
+            '  env: {SHARED: base, PROJECT: default-proj}\n'
+            'tools:\n'
+            '  - {name: a, argv: ["true"]}\n'
+            '  - name: b\n'
+            '    argv: ["true"]\n'
+            '    env: {PROJECT: other-proj}\n'
+        )
+        self.assertEqual({"SHARED": "base", "PROJECT": "default-proj"}, spec.tools["a"].env)
+        self.assertEqual({"SHARED": "base", "PROJECT": "other-proj"}, spec.tools["b"].env)
+
+    def test_invalid_env_var_name_is_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "invalid env var name"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: x\n'
+                '    argv: ["true"]\n'
+                '    env: {"BAD-NAME": v}\n'
+            )
+
+    def test_non_string_env_value_is_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "must be a string"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: x\n'
+                '    argv: ["true"]\n'
+                '    env: {NUM: 1}\n'
+            )
+
+    def test_env_not_mapping_is_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "env must be a mapping"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: x\n'
+                '    argv: ["true"]\n'
+                '    env: [FOO=bar]\n'
+            )
+
+    def test_defaults_env_validated(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "defaults.*invalid env var name"):
+            load_yaml(
+                'server: {name: t}\n'
+                'defaults:\n'
+                '  env: {"1BAD": v}\n'
+                'tools:\n'
+                '  - {name: x, argv: ["true"]}\n'
+            )
+
+
+class EnvExecTest(unittest.TestCase):
+    PRINT_VAR = "import os; print(os.environ.get('CLIWRAP_TEST_VAR', '(unset)'))"
+
+    def tool(self, env) -> cliwrap.ToolSpec:
+        return cliwrap.ToolSpec(
+            name="t", description="", argv=[sys.executable, "-c", self.PRINT_VAR], env=env,
+        )
+
+    def test_run_sync_forces_env_var(self):
+        tool = self.tool({"CLIWRAP_TEST_VAR": "forced"})
+        self.assertEqual("forced\n", cliwrap.run_sync(tool, tool.argv))
+
+    def test_forced_env_overrides_inherited(self):
+        import os
+
+        os.environ["CLIWRAP_TEST_VAR"] = "parent"
+        self.addCleanup(os.environ.pop, "CLIWRAP_TEST_VAR", None)
+        tool = self.tool({"CLIWRAP_TEST_VAR": "forced"})
+        self.assertEqual("forced\n", cliwrap.run_sync(tool, tool.argv))
+
+    def test_parent_env_still_inherited_alongside_forced(self):
+        import os
+
+        os.environ["CLIWRAP_OTHER_VAR"] = "inherited"
+        self.addCleanup(os.environ.pop, "CLIWRAP_OTHER_VAR", None)
+        tool = cliwrap.ToolSpec(
+            name="t", description="",
+            argv=[sys.executable, "-c", "import os; print(os.environ['CLIWRAP_OTHER_VAR'])"],
+            env={"CLIWRAP_TEST_VAR": "forced"},
+        )
+        self.assertEqual("inherited\n", cliwrap.run_sync(tool, tool.argv))
+
+    def test_no_env_config_inherits_parent(self):
+        import os
+
+        os.environ["CLIWRAP_TEST_VAR"] = "parent"
+        self.addCleanup(os.environ.pop, "CLIWRAP_TEST_VAR", None)
+        tool = self.tool({})
+        self.assertEqual("parent\n", cliwrap.run_sync(tool, tool.argv))
+
+    def test_job_start_forces_env_var(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs = cliwrap.JobManager("testsrv", cache_dir=Path(tmp))
+            tool = cliwrap.ToolSpec(
+                name="j", description="", argv=[], mode="job",
+                env={"CLIWRAP_TEST_VAR": "forced"},
+            )
+            msg = jobs.start(tool, [sys.executable, "-c", self.PRINT_VAR])
+            job_id = msg.splitlines()[0].removeprefix("job started: ")
+            import time
+
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                state, _rc = jobs._poll(job_id)
+                if state != "running":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(
+                "forced\n", (jobs.jobs_dir / job_id / "stdout.log").read_text(),
+            )
+
+
 class OutputDirTest(unittest.TestCase):
     """全 sync ツールに自動注入される output_dir param の挙動。"""
 

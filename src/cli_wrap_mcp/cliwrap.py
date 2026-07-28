@@ -39,6 +39,7 @@ ON_LARGE_OUTPUT_MODES = {"truncate", "spill"}
 
 PARAM_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # エンジンが全 sync ツールに自動注入するパラメータ名 (config での定義は禁止)
 RESERVED_PARAM_NAMES = {"output_dir"}
@@ -80,6 +81,7 @@ class ToolSpec:
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
     on_large_output: str = "truncate"
     params: dict[str, ParamSpec] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -162,14 +164,38 @@ def _load_param(tool_name: str, pname: str, raw: dict[str, Any]) -> ParamSpec:
     return spec
 
 
-def _load_tool(raw: dict[str, Any], default_on_large_output: str = "truncate") -> ToolSpec:
+def _load_env(ctx: str, raw: Any) -> dict[str, str]:
+    """`env:` セクション (環境変数名 -> 値) を検証して返す。"""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{ctx}: env must be a mapping of VAR_NAME -> string")
+    env: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not ENV_NAME_RE.match(key):
+            raise ConfigError(
+                f"{ctx}: invalid env var name {key!r} (must match {ENV_NAME_RE.pattern})"
+            )
+        if not isinstance(value, str):
+            raise ConfigError(
+                f"{ctx}: env value for {key!r} must be a string (quote numbers in YAML)"
+            )
+        env[key] = value
+    return env
+
+
+def _load_tool(
+    raw: dict[str, Any],
+    default_on_large_output: str = "truncate",
+    default_env: dict[str, str] | None = None,
+) -> ToolSpec:
     name = raw.get("name")
     if not name or not isinstance(name, str) or not TOOL_NAME_RE.match(name):
         raise ConfigError(f"tools[].name is required and must match {TOOL_NAME_RE.pattern}: {name!r}")
     ctx = f"tools.{name}"
     unknown = set(raw) - {
         "name", "description", "argv", "mode", "timeout_sec", "max_output_bytes",
-        "on_large_output", "params",
+        "on_large_output", "params", "env",
     }
     if unknown:
         raise ConfigError(f"{ctx}: unknown keys {sorted(unknown)}")
@@ -202,6 +228,8 @@ def _load_tool(raw: dict[str, Any], default_on_large_output: str = "truncate") -
         max_output_bytes=raw.get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES),
         on_large_output=on_large_output,
         params=params,
+        # tool の env は server 全体の defaults.env の上にマージ (同名キーは tool 側が勝つ)
+        env={**(default_env or {}), **_load_env(ctx, raw.get("env"))},
     )
 
     referenced: set[str] = set()
@@ -241,9 +269,10 @@ def load_config(path: str | Path) -> ServerSpec:
     defaults_raw = raw.get("defaults") or {}
     if not isinstance(defaults_raw, dict):
         raise ConfigError("'defaults' must be a mapping")
-    unknown_defaults = set(defaults_raw) - {"on_large_output"}
+    unknown_defaults = set(defaults_raw) - {"on_large_output", "env"}
     if unknown_defaults:
         raise ConfigError(f"defaults: unknown keys {sorted(unknown_defaults)}")
+    default_env = _load_env("defaults", defaults_raw.get("env"))
     default_olo = defaults_raw.get("on_large_output", "truncate")
     if default_olo not in ON_LARGE_OUTPUT_MODES:
         raise ConfigError(
@@ -256,7 +285,7 @@ def load_config(path: str | Path) -> ServerSpec:
     for tool_raw in tools_raw:
         if not isinstance(tool_raw, dict):
             raise ConfigError("each tools entry must be a mapping")
-        tool = _load_tool(tool_raw, default_on_large_output=default_olo)
+        tool = _load_tool(tool_raw, default_on_large_output=default_olo, default_env=default_env)
         if tool.name in server.tools:
             raise ConfigError(f"duplicate tool name: {tool.name}")
         server.tools[tool.name] = tool
@@ -375,6 +404,16 @@ def _spill_output(tool: ToolSpec, data: bytes, spill_dir: Path) -> str:
     return _file_reply(data, path, reason=f" (> {tool.max_output_bytes})")
 
 
+def _exec_env(tool: ToolSpec) -> dict[str, str] | None:
+    """config の env 強制を反映した実行環境を返す (強制なしなら None = 親環境継承)。
+
+    継承環境の上にマージするので、同名の変数は config 側が常に勝つ。
+    """
+    if not tool.env:
+        return None
+    return {**os.environ, **tool.env}
+
+
 def run_sync(
     tool: ToolSpec,
     argv: list[str],
@@ -387,6 +426,7 @@ def run_sync(
             shell=False,
             capture_output=True,
             timeout=tool.timeout_sec,
+            env=_exec_env(tool),
         )
     except subprocess.TimeoutExpired:
         return f"error: command timed out after {tool.timeout_sec}s: {argv!r}"
@@ -470,6 +510,7 @@ class JobManager:
                     stdout=out_fp,
                     stderr=err_fp,
                     start_new_session=True,  # cancel で process group ごと止めるため
+                    env=_exec_env(tool),
                 )
             except OSError as exc:
                 return f"error: failed to start {argv!r}: {exc}"

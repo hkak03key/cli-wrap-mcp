@@ -122,6 +122,7 @@ Top level:
 | `server.name` | yes | MCP server name. |
 | `server.description` | no | Served as the MCP `instructions`. |
 | `defaults.on_large_output` | no | Default large-output mode for all tools: `truncate` (default) or `spill`. |
+| `defaults.env` | no | Environment variables forced for every tool (mapping of `VAR_NAME` → string; quote numbers). Merged over the inherited environment at execution time, so config values always win. |
 | `tools` | yes | List of tool definitions (at least one). |
 
 Per tool:
@@ -136,6 +137,7 @@ Per tool:
 | `max_output_bytes` | no | `50000` | Output size limit returned inline. |
 | `on_large_output` | no | inherits `defaults` | `truncate` or `spill`. |
 | `params` | no | `{}` | Mapping of parameter name → spec. |
+| `env` | no | `{}` | Environment variables forced for this tool. Merged over `defaults.env` (tool wins), then over the inherited environment at execution time. |
 
 Per parameter (`params.<name>`):
 
