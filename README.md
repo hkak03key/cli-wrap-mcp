@@ -58,6 +58,12 @@ Safety is the core of this engine, enforced at execution and load time:
   `output_dir` parameter to force the full stdout into a file of their choosing.
 - **Job isolation.** Background job IDs are strictly format-checked, blocking path
   traversal through `job_id`.
+- **Guardrails, not a sandbox.** For "arbitrary subcommand" tools (an `array` param
+  with `allow_dash_prefix: true`), `deny_pattern`, forced trailing flags, and `env`
+  forcing constrain what the model can do — but a determined CLI often has more than
+  one spelling for the same effect. Treat them as accident prevention and put the
+  real security boundary in the credentials the wrapped CLI runs with (see
+  [`examples/gcloud.yml`](examples/gcloud.yml)).
 
 Trust model: the YAML config is a trusted local file (it decides *which* binaries
 can run); the tool *arguments* coming from the model are untrusted and constrained
@@ -83,6 +89,10 @@ Try the bundled examples:
 ```sh
 uvx cli-wrap-mcp@0.1.0 --config examples/echo.yml
 ```
+
+[`examples/gcloud.yml`](examples/gcloud.yml) shows the "arbitrary subcommand with
+forced env vars and options" pattern (variadic `array` param + `deny_pattern` +
+`env` forcing).
 
 ### Claude Code
 

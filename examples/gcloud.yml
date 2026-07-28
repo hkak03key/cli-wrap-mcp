@@ -1,0 +1,52 @@
+# Arbitrary-subcommand example: expose gcloud while forcing env vars and options.
+#
+# The `args` array param lets the model run any gcloud subcommand, while the
+# config pins the project three ways:
+#   1. env forcing        — CLOUDSDK_* variables override the inherited environment
+#   2. deny_pattern       — flags that could redirect project/account/credentials
+#                           (or smuggle flags in via --flags-file) are rejected
+#   3. forced trailing flag — `--project=...` placed AFTER the args slot wins over
+#                           any earlier occurrence (argparse: last one wins)
+#
+# Why all three: gcloud's precedence is CLI flag > environment variable > config,
+# so env forcing alone loses to a model-supplied `--project=...`. The deny list
+# and the trailing flag close that gap — but they are guardrails, not a sandbox.
+# The real security boundary is IAM: run the server under credentials (e.g. a
+# dedicated configuration or service account) that can only do what you intend
+# to allow.
+#
+# Run (replace my-project with a real project):
+#   cli-wrap-mcp --config examples/gcloud.yml
+server:
+  name: gcloud
+  description: Run gcloud subcommands with a pinned project and credentials.
+
+defaults:
+  env:
+    CLOUDSDK_CORE_DISABLE_PROMPTS: "1"  # never hang on interactive prompts
+
+tools:
+  - name: gcloud
+    description: >-
+      Run a gcloud subcommand. Pass the subcommand and its flags as separate
+      args items, e.g. ["compute", "instances", "list", "--zone=us-central1-a"].
+      The project is pinned by the server; do not pass --project.
+    # The forced flag comes AFTER {args} so it overrides anything the model sent.
+    argv: ["gcloud", "{args}", "--project=my-project"]
+    timeout_sec: 120
+    on_large_output: spill
+    env:
+      CLOUDSDK_CORE_PROJECT: my-project
+      # Point at an isolated gcloud configuration dir holding the credentials
+      # you want to allow (the actual IAM boundary):
+      # CLOUDSDK_CONFIG: /path/to/restricted-gcloud-config
+    params:
+      args:
+        type: array
+        description: gcloud subcommand and flags, one argv element per item.
+        allow_dash_prefix: true
+        # Block flags that would redirect project/account/credentials, and
+        # --flags-file (which could smuggle any of them back in via YAML).
+        # Space-separated forms are covered too: "--project foo" arrives as two
+        # items and the bare "--project" item still fullmatches "(=.*)?".
+        deny_pattern: "--(project|account|configuration|impersonate-service-account|billing-project|flags-file)(=.*)?"
