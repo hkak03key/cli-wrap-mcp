@@ -50,3 +50,35 @@ tools:
         # Space-separated forms are covered too: "--project foo" arrives as two
         # items and the bare "--project" item still fullmatches "(=.*)?".
         deny_pattern: "--(project|account|configuration|impersonate-service-account|billing-project|flags-file)(=.*)?"
+
+  # Variant that makes the IAM boundary concrete: every invocation impersonates
+  # a fixed, least-privilege service account. Whatever flags slip through the
+  # guardrails, the call can only do what that SA's IAM roles allow. The ambient
+  # credentials the server runs with only need roles/iam.serviceAccountTokenCreator
+  # on the SA — they don't need any resource permissions themselves.
+  - name: gcloud_as_sa
+    description: >-
+      Run a gcloud subcommand impersonating a fixed service account. Pass the
+      subcommand and its flags as separate args items. The project and the
+      impersonated identity are pinned by the server; do not pass --project or
+      --impersonate-service-account.
+    # Both forced flags come AFTER {args}: even if an impersonation flag slipped
+    # past the deny list, the trailing one wins (argparse: last one wins).
+    argv:
+      - gcloud
+      - "{args}"
+      - --project=my-project
+      - --impersonate-service-account=restricted-sa@my-project.iam.gserviceaccount.com
+    timeout_sec: 120
+    on_large_output: spill
+    env:
+      CLOUDSDK_CORE_PROJECT: my-project
+      # Same impersonation at the env layer (belt and braces: flags beat env,
+      # so this covers any code path that reads config instead of argv).
+      CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT: restricted-sa@my-project.iam.gserviceaccount.com
+    params:
+      args:
+        type: array
+        description: gcloud subcommand and flags, one argv element per item.
+        allow_dash_prefix: true
+        deny_pattern: "--(project|account|configuration|impersonate-service-account|billing-project|flags-file)(=.*)?"
