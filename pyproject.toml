@@ -1,6 +1,6 @@
 [project]
 name = "cli-wrap-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Turn any CLI into an MCP server with a declarative YAML config"
 readme = "README.md"
 license = "MIT"
@@ -30,7 +30,7 @@ Repository = "https://github.com/hkak03key/cli-wrap-mcp"
 Issues = "https://github.com/hkak03key/cli-wrap-mcp/issues"
 
 [project.scripts]
-cli-wrap-mcp = "cli_wrap_mcp.cliwrap:main"
+cli-wrap-mcp = "cli_wrap_mcp.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.11.0,<0.12.0"]
