@@ -1,6 +1,6 @@
 [project]
 name = "cli-wrap-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Turn any CLI into an MCP server with a declarative YAML config"
 readme = "README.md"
 license = "MIT"
