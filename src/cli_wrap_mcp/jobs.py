@@ -1,4 +1,7 @@
-"""job モード (長時間 CLI の非同期実行): job の起動・状態確認・結果取得・キャンセル。"""
+"""job モード (長時間 CLI の非同期実行): job の起動・状態確認・結果取得・キャンセル。
+
+起動もパッケージ安全不変条件 (__init__ 参照) に従い、常に shell=False の argv 配列。
+"""
 from __future__ import annotations
 
 import json
