@@ -498,35 +498,61 @@ def _truncate(data: bytes, limit: int) -> str:
     return f"{truncated}\n[cliwrap: output truncated at {limit} bytes (total {len(data)} bytes)]"
 
 
-def _write_output_file(tool: ToolSpec, data: bytes, out_dir: Path) -> Path:
-    """stdout 全量を <out_dir>/<tool>-<id>.out に書く (OSError は呼び出し側で処理)。"""
-    out_dir.mkdir(parents=True, exist_ok=True)
+def _invocation_meta(
+    tool: ToolSpec,
+    argv: list[str],
+    started_at: str,
+    exit_code: int | None,
+    timed_out: bool = False,
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "tool": tool.name,
+        "argv": argv,
+        "started_at": started_at,
+        "exit_code": exit_code,
+    }
+    if timed_out:
+        meta["timed_out"] = True
+    return meta
+
+
+def _write_invocation_dir(
+    tool: ToolSpec,
+    parent: Path,
+    stdout: bytes,
+    stderr: bytes,
+    meta: dict[str, Any],
+) -> Path:
+    """1 実行分の出力一式を <parent>/<tool>-<id>/ に書く (OSError は呼び出し側で処理)。
+
+    stdout.log / stderr.log / meta.json という構成で、job モードの job dir と
+    レイアウトを揃えている。meta.json (argv・時刻・exit code) があることで
+    「何を実行してこの出力が出たか」までが証跡として残る。
+    """
+    parent.mkdir(parents=True, exist_ok=True)
     name = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
-    path = out_dir / f"{tool.name}-{name}.out"
-    path.write_bytes(data)
-    return path
+    inv_dir = parent / f"{tool.name}-{name}"
+    inv_dir.mkdir()
+    (inv_dir / "stdout.log").write_bytes(stdout)
+    (inv_dir / "stderr.log").write_bytes(stderr)
+    (inv_dir / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False), encoding="utf-8",
+    )
+    return inv_dir
 
 
-def _file_reply(data: bytes, path: Path, reason: str = "") -> str:
+def _file_reply(data: bytes, inv_dir: Path, reason: str = "") -> str:
     """全量ファイルへの参照+抜粋だけを返す (呼び出し側 context の節約)。"""
     head = data[:FILE_EXCERPT_BYTES].decode("utf-8", errors="replace")
     tail = data[-FILE_EXCERPT_BYTES:].decode("utf-8", errors="replace")
     return (
         f"[cliwrap: output is {len(data)} bytes{reason}; full output saved to file]\n"
-        f"file: {path}\n"
+        f"file: {inv_dir / 'stdout.log'}\n"
+        f"(stderr.log and meta.json with the executed argv are in the same directory)\n"
         f"Do not read it whole: use Read with offset/limit, or grep, to inspect parts.\n"
         f"--- head ({FILE_EXCERPT_BYTES} bytes) ---\n{head}\n"
         f"--- tail ({FILE_EXCERPT_BYTES} bytes) ---\n{tail}"
     )
-
-
-def _overflow_to_file(tool: ToolSpec, data: bytes, file_dir: Path) -> str:
-    try:
-        path = _write_output_file(tool, data, file_dir)
-    except OSError as exc:
-        print(f"cliwrap: file output failed ({exc}); falling back to truncate", file=sys.stderr)
-        return _truncate(data, tool.inline_max_output_bytes)
-    return _file_reply(data, path, reason=f" (> {tool.inline_max_output_bytes})")
 
 
 def _stderr_tail(stderr: bytes) -> str:
@@ -549,6 +575,12 @@ def run_sync(
     file_dir: Path | None = None,
     output_dir: Path | None = None,
 ) -> str:
+    started_at = datetime.now(timezone.utc).isoformat()
+    # per-call 指定 (output_dir) または file mode では、成否・サイズに関係なく
+    # 常に全量をファイル化する (証跡: 失敗した実行も記録に残す)
+    dest = output_dir if output_dir is not None else (
+        file_dir if tool.output_mode == "file" else None
+    )
     try:
         proc = subprocess.run(
             argv,
@@ -557,27 +589,34 @@ def run_sync(
             timeout=tool.timeout_sec,
             env=_exec_env(tool),
         )
-    except subprocess.TimeoutExpired:
-        return f"error: command timed out after {tool.timeout_sec}s: {argv!r}"
+    except subprocess.TimeoutExpired as exc:
+        msg = f"error: command timed out after {tool.timeout_sec}s: {argv!r}"
+        if dest is not None:
+            # timeout でも捕捉済みの部分出力を best-effort で証跡に残す
+            meta = _invocation_meta(tool, argv, started_at, None, timed_out=True)
+            try:
+                inv_dir = _write_invocation_dir(
+                    tool, dest, exc.stdout or b"", exc.stderr or b"", meta,
+                )
+                msg += f"\npartial output saved to: {inv_dir}"
+            except OSError as write_exc:
+                msg += f"\n(failed to save partial output: {write_exc})"
+        return msg
     except OSError as exc:
         return f"error: failed to execute {argv!r}: {exc}"
-    # per-call 指定 (output_dir) または file mode では、成否・サイズに関係なく
-    # 常に全量をファイル化する (証跡: 失敗した実行も記録に残す)
-    dest = output_dir if output_dir is not None else (
-        file_dir if tool.output_mode == "file" else None
-    )
     if dest is not None:
+        meta = _invocation_meta(tool, argv, started_at, proc.returncode)
         try:
-            path = _write_output_file(tool, proc.stdout, dest)
+            inv_dir = _write_invocation_dir(tool, dest, proc.stdout, proc.stderr, meta)
         except OSError as exc:
             return f"error: failed to write output to {dest}: {exc}"
         if proc.returncode != 0:
             return (
                 f"error: command exited with code {proc.returncode}\n"
-                f"output saved to: {path}\n"
+                f"output saved to: {inv_dir}\n"
                 f"stderr (tail):\n{_stderr_tail(proc.stderr)}"
             )
-        return _file_reply(proc.stdout, path)
+        return _file_reply(proc.stdout, inv_dir)
     if proc.returncode != 0:
         return (
             f"error: command exited with code {proc.returncode}\n"
@@ -588,7 +627,18 @@ def run_sync(
         and tool.inline_on_large_output == "file"
         and file_dir is not None
     ):
-        return _overflow_to_file(tool, proc.stdout, file_dir)
+        meta = _invocation_meta(tool, argv, started_at, proc.returncode)
+        try:
+            inv_dir = _write_invocation_dir(tool, file_dir, proc.stdout, proc.stderr, meta)
+        except OSError as exc:
+            print(
+                f"cliwrap: file output failed ({exc}); falling back to truncate",
+                file=sys.stderr,
+            )
+            return _truncate(proc.stdout, tool.inline_max_output_bytes)
+        return _file_reply(
+            proc.stdout, inv_dir, reason=f" (> {tool.inline_max_output_bytes})",
+        )
     return _truncate(proc.stdout, tool.inline_max_output_bytes)
 
 

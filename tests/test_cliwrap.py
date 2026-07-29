@@ -542,11 +542,21 @@ class FileOutputModeTest(unittest.TestCase):
         self.assertIn("full output saved to file", out)
         self.assertIn("1001 bytes", out)  # 総バイト数 (1000 + 改行)
         self.assertIn("offset/limit", out)
-        files = list(self.file_dir.iterdir())
-        self.assertEqual(1, len(files))
-        self.assertTrue(files[0].name.startswith("t-"))
-        self.assertIn(str(files[0]), out)  # 絶対パスが返り値に含まれる
-        self.assertEqual(b"x" * 1000 + b"\n", files[0].read_bytes())  # 全量・無切り詰め
+        dirs = list(self.file_dir.iterdir())
+        self.assertEqual(1, len(dirs))
+        inv = dirs[0]
+        self.assertTrue(inv.is_dir())
+        self.assertTrue(inv.name.startswith("t-"))
+        self.assertIn(str(inv / "stdout.log"), out)  # 絶対パスが返り値に含まれる
+        self.assertEqual(b"x" * 1000 + b"\n", (inv / "stdout.log").read_bytes())  # 全量
+        self.assertEqual(b"", (inv / "stderr.log").read_bytes())
+        import json
+
+        meta = json.loads((inv / "meta.json").read_text())
+        self.assertEqual("t", meta["tool"])
+        self.assertEqual(tool.argv, meta["argv"])
+        self.assertEqual(0, meta["exit_code"])
+        self.assertIn("started_at", meta)
 
     def test_file_mode_writes_even_small_output(self):
         # file mode は証跡目的なので、上限以下でも常にファイル化する
@@ -564,8 +574,31 @@ class FileOutputModeTest(unittest.TestCase):
         self.assertIn("exited with code 3", out)
         self.assertIn("output saved to:", out)
         self.assertIn("boom", out)
-        files = list(self.file_dir.iterdir())
-        self.assertEqual(1, len(files))  # 失敗した実行も証跡が残る
+        dirs = list(self.file_dir.iterdir())
+        self.assertEqual(1, len(dirs))  # 失敗した実行も証跡が残る
+        self.assertEqual(b"partial\n", (dirs[0] / "stdout.log").read_bytes())
+        self.assertEqual(b"boom", (dirs[0] / "stderr.log").read_bytes())
+        import json
+
+        self.assertEqual(3, json.loads((dirs[0] / "meta.json").read_text())["exit_code"])
+
+    def test_file_mode_timeout_saves_partial_output(self):
+        tool = cliwrap.ToolSpec(
+            name="t", description="", output_mode="file", timeout_sec=1,
+            argv=[sys.executable, "-u", "-c",
+                  "import time; print('before-sleep'); time.sleep(5)"],
+        )
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        self.assertIn("timed out after 1s", out)
+        self.assertIn("partial output saved to:", out)
+        dirs = list(self.file_dir.iterdir())
+        self.assertEqual(1, len(dirs))
+        self.assertEqual(b"before-sleep\n", (dirs[0] / "stdout.log").read_bytes())
+        import json
+
+        meta = json.loads((dirs[0] / "meta.json").read_text())
+        self.assertIsNone(meta["exit_code"])
+        self.assertTrue(meta["timed_out"])
 
     def test_inline_truncate_never_writes_file(self):
         tool = self.tool(output_mode="inline")
@@ -809,11 +842,11 @@ class OutputDirTest(unittest.TestCase):
     def test_output_dir_forces_file_even_for_small_output(self):
         out = self.call(self.server(), "echo", {"msg": "hi", "output_dir": self.dest})
         self.assertIn("full output saved to file", out)
-        files = list(Path(self.dest).iterdir())  # dir は mkdir -p 相当で自動作成
-        self.assertEqual(1, len(files))
-        self.assertTrue(files[0].name.startswith("echo-"))
-        self.assertIn(str(files[0]), out)
-        self.assertEqual(b"hi\n", files[0].read_bytes())  # 小出力でも全量ファイル化
+        dirs = list(Path(self.dest).iterdir())  # dir は mkdir -p 相当で自動作成
+        self.assertEqual(1, len(dirs))
+        self.assertTrue(dirs[0].name.startswith("echo-"))
+        self.assertIn(str(dirs[0] / "stdout.log"), out)
+        self.assertEqual(b"hi\n", (dirs[0] / "stdout.log").read_bytes())  # 小出力でも全量
 
     def test_without_output_dir_behaves_as_before(self):
         out = self.call(self.server(), "echo", {"msg": "hi"})
@@ -861,8 +894,8 @@ class OutputDirTest(unittest.TestCase):
         server = cliwrap.build_server(spec, cache_dir=Path(self._tmp.name))
         out = self.call(server, "big", {"output_dir": self.dest})
         self.assertIn("1001 bytes", out)
-        files = list(Path(self.dest).iterdir())
-        self.assertEqual(b"x" * 1000 + b"\n", files[0].read_bytes())  # 切り詰めなし
+        dirs = list(Path(self.dest).iterdir())
+        self.assertEqual(b"x" * 1000 + b"\n", (dirs[0] / "stdout.log").read_bytes())  # 全量
 
     def test_reserved_param_name_is_config_error(self):
         with self.assertRaisesRegex(cliwrap.ConfigError, "reserved"):
