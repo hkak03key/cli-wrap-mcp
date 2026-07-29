@@ -1,17 +1,7 @@
-"""cliwrap: 宣言的 YAML config から CLI ラップ MCP サーバーを動的生成するエンジン。
+"""console script エントリポイント。
 
-使い方:
-    cli-wrap-mcp --config <path.yml>
-
-設計原則 (安全性がこの仕組みの核):
-- 実行は常に shell=False の argv 配列。シェル文字列連結の経路は存在しない
-- パラメータ値は検証 (type / pattern fullmatch / deny_pattern / enum) を通過してから
-  argv 要素に埋め込む。array param は要素全体の placeholder のみに展開を許し、
-  各 item に同じ検証を適用する
-- 引数インジェクション対策: `-` で始まる値は既定で拒否 (per-param の
-  allow_dash_prefix = true で明示的に許可可能)
-- config ロード時に argv 内の未定義プレースホルダはエラー
-- stdout は MCP プロトコル専用。ログ・デバッグ出力は必ず stderr へ
+使い方とエンジン全体の設計原則の正はパッケージ docstring (cli_wrap_mcp.__doc__) にあり、
+--help の説明文にもそれを表示する。
 """
 from __future__ import annotations
 
@@ -20,6 +10,7 @@ import sys
 
 import yaml
 
+import cli_wrap_mcp
 from cli_wrap_mcp.config import load_config
 from cli_wrap_mcp.server import build_server
 from cli_wrap_mcp.spec import ConfigError
@@ -27,7 +18,7 @@ from cli_wrap_mcp.spec import ConfigError
 
 def main(argv: list[str] | None = None) -> int:
     """config をロードして MCP サーバーを起動する (console script のエントリポイント)。"""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=cli_wrap_mcp.__doc__)
     parser.add_argument("--config", required=True, help="YAML config path (.yml/.yaml)")
     args = parser.parse_args(argv)
     try:
