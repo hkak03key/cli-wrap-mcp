@@ -3,19 +3,14 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
-import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from cli_wrap_mcp.execution import exec_env
+from cli_wrap_mcp.runtime import INVOCATION_ID_RE, exec_env, new_invocation_id
 from cli_wrap_mcp.spec import STDERR_TAIL_BYTES, ParamValidationError, ToolSpec
-
-JOB_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{6}$")
 
 
 def _tail_file(path: Path, limit: int) -> str:
@@ -39,6 +34,9 @@ class JobManager:
     <jobs_dir>/<job_id>/ のファイルに残す (jobs_dir は tool の出力ルート配下の
     jobs/。既定は cache)。サーバー再起動後の孤児 job は best-effort
     (pid 生存確認と exit_code ファイル) でのみ参照できる。
+
+    job dir の stdout.log / stderr.log / meta.json というレイアウトは、
+    sync 実行の証跡 dir (execution._write_invocation_dir) と揃えている。
     """
 
     def __init__(self, jobs_dir: Path):
@@ -49,13 +47,13 @@ class JobManager:
     def _job_dir(self, job_id: str) -> Path:
         """job_id を検証して job dir のパスを返す。"""
         # job_id は client 入力なので、パストラバーサルを形式検証で遮断する
-        if not JOB_ID_RE.match(job_id):
+        if not INVOCATION_ID_RE.match(job_id):
             raise ParamValidationError(f"invalid job_id: {job_id!r}")
         return self.jobs_dir / job_id
 
     def start(self, tool: ToolSpec, argv: list[str]) -> str:
         """コマンドをバックグラウンド起動し、job_id と操作方法を返す。"""
-        job_id = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        job_id = new_invocation_id()
         jdir = self.jobs_dir / job_id
         jdir.mkdir(parents=True)
         with open(jdir / "stdout.log", "wb") as out_fp, open(jdir / "stderr.log", "wb") as err_fp:

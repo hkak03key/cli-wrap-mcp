@@ -19,6 +19,7 @@ from cli_wrap_mcp.spec import (
     DEFAULT_TIMEOUT_SEC,
     ENV_NAME_RE,
     INLINE_ON_LARGE_OUTPUT_MODES,
+    JOB_TOOL_SUFFIXES,
     OUTPUT_MODES,
     PARAM_NAME_RE,
     PY_TYPES,
@@ -278,7 +279,7 @@ def load_config(path: str | Path) -> ServerSpec:
     exposed: set[str] = set()
     for tool in server.tools.values():
         if tool.mode == "job":
-            names = [f"{tool.name}_{suffix}" for suffix in ("start", "status", "result", "cancel")]
+            names = [f"{tool.name}_{suffix}" for suffix in JOB_TOOL_SUFFIXES]
         else:
             names = [tool.name]
         for n in names:

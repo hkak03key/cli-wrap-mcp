@@ -5,15 +5,13 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
-import time
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from cli_wrap_mcp.runtime import exec_env, new_invocation_id
 from cli_wrap_mcp.spec import FILE_EXCERPT_BYTES, STDERR_TAIL_BYTES, ToolSpec
 
 
@@ -59,8 +57,7 @@ def _write_invocation_dir(
     「何を実行してこの出力が出たか」までが証跡として残る。
     """
     parent.mkdir(parents=True, exist_ok=True)
-    name = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
-    inv_dir = parent / f"{tool.name}-{name}"
+    inv_dir = parent / f"{tool.name}-{new_invocation_id()}"
     inv_dir.mkdir()
     (inv_dir / "stdout.log").write_bytes(stdout)
     (inv_dir / "stderr.log").write_bytes(stderr)
@@ -87,16 +84,6 @@ def _file_reply(data: bytes, inv_dir: Path, reason: str = "") -> str:
 def _stderr_tail(stderr: bytes) -> str:
     """stderr の末尾 (エラー要約向け) をテキストで返す。"""
     return stderr[-STDERR_TAIL_BYTES:].decode("utf-8", errors="replace")
-
-
-def exec_env(tool: ToolSpec) -> dict[str, str] | None:
-    """config の env 強制を反映した実行環境を返す (強制なしなら None = 親環境継承)。
-
-    継承環境の上にマージするので、同名の変数は config 側が常に勝つ。
-    """
-    if not tool.env:
-        return None
-    return {**os.environ, **tool.env}
 
 
 def run_sync(

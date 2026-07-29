@@ -11,6 +11,7 @@ from cli_wrap_mcp.jobs import JobManager
 from cli_wrap_mcp.rendering import render_argv
 from cli_wrap_mcp.spec import (
     ANNOTATIONS,
+    JOB_TOOL_SUFFIXES,
     ConfigError,
     ParamValidationError,
     ServerSpec,
@@ -122,12 +123,6 @@ def register_job_tool(mcp, tool: ToolSpec, jobs: JobManager) -> None:
         return jobs.start(_tool, argv)
 
     start_fn = _make_tool_fn(f"tool_{tool.name}_start", tool, invoke_start)
-    mcp.add_tool(
-        start_fn,
-        name=f"{tool.name}_start",
-        description=_tool_description(tool)
-        + "\nStarts the command as a background job and returns a job_id immediately.",
-    )
 
     def status_fn(job_id: str) -> str:
         try:
@@ -147,24 +142,37 @@ def register_job_tool(mcp, tool: ToolSpec, jobs: JobManager) -> None:
         except ParamValidationError as exc:
             return f"error: {exc}"
 
-    mcp.add_tool(
-        status_fn,
-        name=f"{tool.name}_status",
-        description=f"Check a background job started by {tool.name}_start: "
-        "running/exited state plus stdout/stderr tail.",
-    )
-    mcp.add_tool(
-        result_fn,
-        name=f"{tool.name}_result",
-        description=f"Fetch the output of a finished job started by {tool.name}_start "
-        "(tail-limited). Returns a notice if the job is still running.",
-    )
-    mcp.add_tool(
-        cancel_fn,
-        name=f"{tool.name}_cancel",
-        description=f"Cancel a running job started by {tool.name}_start "
-        "(SIGTERM to the process group).",
-    )
+    # 公開名は spec.JOB_TOOL_SUFFIXES から導出する (config のロード時衝突検査と同じ一覧)
+    handlers = {
+        "start": (
+            start_fn,
+            _tool_description(tool)
+            + "\nStarts the command as a background job and returns a job_id immediately.",
+        ),
+        "status": (
+            status_fn,
+            f"Check a background job started by {tool.name}_start: "
+            "running/exited state plus stdout/stderr tail.",
+        ),
+        "result": (
+            result_fn,
+            f"Fetch the output of a finished job started by {tool.name}_start "
+            "(tail-limited). Returns a notice if the job is still running.",
+        ),
+        "cancel": (
+            cancel_fn,
+            f"Cancel a running job started by {tool.name}_start "
+            "(SIGTERM to the process group).",
+        ),
+    }
+    if set(handlers) != set(JOB_TOOL_SUFFIXES):
+        raise ConfigError(
+            f"job tool handlers {sorted(handlers)} do not match "
+            f"JOB_TOOL_SUFFIXES {sorted(JOB_TOOL_SUFFIXES)}"
+        )
+    for suffix in JOB_TOOL_SUFFIXES:
+        fn, description = handlers[suffix]
+        mcp.add_tool(fn, name=f"{tool.name}_{suffix}", description=description)
 
 
 def _tool_description(tool: ToolSpec) -> str:

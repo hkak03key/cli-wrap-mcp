@@ -18,6 +18,11 @@ OUTPUT_MODES = {"inline", "file"}
 INLINE_ON_LARGE_OUTPUT_MODES = {"truncate", "file"}
 SUPPORTED_MODES = {"sync", "job"}
 
+# job モード 1 tool が公開する MCP ツール名の suffix 一覧。
+# config のロード時衝突検査と server の登録名生成の両方がこの一覧から導出する
+# (片方だけ変えると検査が形骸化するため、正はここ 1 箇所に置く)
+JOB_TOOL_SUFFIXES = ("start", "status", "result", "cancel")
+
 PARAM_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
