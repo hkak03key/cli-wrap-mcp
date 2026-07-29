@@ -34,13 +34,16 @@ from typing import Any
 import yaml
 
 DEFAULT_TIMEOUT_SEC = 60
-DEFAULT_MAX_OUTPUT_BYTES = 50_000
+DEFAULT_INLINE_MAX_OUTPUT_BYTES = 50_000
 STDERR_TAIL_BYTES = 2_000
-SPILL_EXCERPT_BYTES = 1_000
-# 出力の返し方。切り詰め/書き出しの閾値はどちらも max_output_bytes:
-# - inline: 応答にそのまま含める (上限超過分は切り詰め)
-# - file:   上限超過時はファイルへ書き出してパス+抜粋を返す (上限以下は inline)
+FILE_EXCERPT_BYTES = 1_000
+# 出力の返し方:
+# - inline: 応答にそのまま含める。上限 (inline_max_output_bytes) 超過時の挙動は
+#           inline_on_large_output (truncate: 切り詰め / file: ファイルへ書き出し)
+# - file:   成否やサイズに関係なく常にファイルへ全量書き出し (証跡用途)、
+#           応答はパス + 抜粋のみ
 OUTPUT_MODES = {"inline", "file"}
+INLINE_ON_LARGE_OUTPUT_MODES = {"truncate", "file"}
 
 PARAM_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -93,9 +96,19 @@ class ToolSpec:
     argv: list[str]
     mode: str = "sync"
     timeout_sec: int = DEFAULT_TIMEOUT_SEC
-    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
+    inline_max_output_bytes: int = DEFAULT_INLINE_MAX_OUTPUT_BYTES
     output_mode: str = "inline"
+    inline_on_large_output: str = "truncate"
     params: dict[str, ParamSpec] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class Defaults:
+    """`defaults:` セクション (tool 側で未指定のときに使う server 全体の既定値)。"""
+    output_mode: str = "inline"
+    inline_max_output_bytes: int = DEFAULT_INLINE_MAX_OUTPUT_BYTES
+    inline_on_large_output: str = "truncate"
     env: dict[str, str] = field(default_factory=dict)
 
 
@@ -196,6 +209,11 @@ def _load_param(tool_name: str, pname: str, raw: dict[str, Any]) -> ParamSpec:
     return spec
 
 
+def _check_choice(ctx: str, key: str, value: Any, allowed: set[str]) -> None:
+    if value not in allowed:
+        raise ConfigError(f"{ctx}: {key} must be one of {sorted(allowed)}, got {value!r}")
+
+
 def _load_env(ctx: str, raw: Any) -> dict[str, str]:
     """`env:` セクション (環境変数名 -> 値) を検証して返す。"""
     if raw is None:
@@ -218,25 +236,23 @@ def _load_env(ctx: str, raw: Any) -> dict[str, str]:
 
 def _load_tool(
     raw: dict[str, Any],
-    default_output_mode: str = "inline",
-    default_env: dict[str, str] | None = None,
+    defaults: Defaults | None = None,
 ) -> ToolSpec:
+    defaults = defaults or Defaults()
     name = raw.get("name")
     if not name or not isinstance(name, str) or not TOOL_NAME_RE.match(name):
         raise ConfigError(f"tools[].name is required and must match {TOOL_NAME_RE.pattern}: {name!r}")
     ctx = f"tools.{name}"
     unknown = set(raw) - {
-        "name", "description", "argv", "mode", "timeout_sec", "max_output_bytes",
-        "output_mode", "params", "env",
+        "name", "description", "argv", "mode", "timeout_sec", "inline_max_output_bytes",
+        "output_mode", "inline_on_large_output", "params", "env",
     }
     if unknown:
         raise ConfigError(f"{ctx}: unknown keys {sorted(unknown)}")
-    output_mode = raw.get("output_mode", default_output_mode)
-    if output_mode not in OUTPUT_MODES:
-        raise ConfigError(
-            f"{ctx}: output_mode must be one of {sorted(OUTPUT_MODES)}, "
-            f"got {output_mode!r}"
-        )
+    output_mode = raw.get("output_mode", defaults.output_mode)
+    _check_choice(ctx, "output_mode", output_mode, OUTPUT_MODES)
+    inline_on_large_output = raw.get("inline_on_large_output", defaults.inline_on_large_output)
+    _check_choice(ctx, "inline_on_large_output", inline_on_large_output, INLINE_ON_LARGE_OUTPUT_MODES)
     argv = raw.get("argv")
     if not argv or not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
         raise ConfigError(f"{ctx}: argv must be a non-empty list of strings")
@@ -257,11 +273,14 @@ def _load_tool(
         argv=list(argv),
         mode=mode,
         timeout_sec=raw.get("timeout_sec", DEFAULT_TIMEOUT_SEC),
-        max_output_bytes=raw.get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES),
+        inline_max_output_bytes=raw.get(
+            "inline_max_output_bytes", defaults.inline_max_output_bytes,
+        ),
         output_mode=output_mode,
+        inline_on_large_output=inline_on_large_output,
         params=params,
         # tool の env は server 全体の defaults.env の上にマージ (同名キーは tool 側が勝つ)
-        env={**(default_env or {}), **_load_env(ctx, raw.get("env"))},
+        env={**defaults.env, **_load_env(ctx, raw.get("env"))},
     )
 
     referenced: set[str] = set()
@@ -296,6 +315,32 @@ def _load_tool(
     return tool
 
 
+def _load_defaults(raw: Any) -> Defaults:
+    if raw is None:
+        return Defaults()
+    if not isinstance(raw, dict):
+        raise ConfigError("'defaults' must be a mapping")
+    unknown = set(raw) - {
+        "output_mode", "inline_max_output_bytes", "inline_on_large_output", "env",
+    }
+    if unknown:
+        raise ConfigError(f"defaults: unknown keys {sorted(unknown)}")
+    defaults = Defaults(
+        output_mode=raw.get("output_mode", "inline"),
+        inline_max_output_bytes=raw.get(
+            "inline_max_output_bytes", DEFAULT_INLINE_MAX_OUTPUT_BYTES,
+        ),
+        inline_on_large_output=raw.get("inline_on_large_output", "truncate"),
+        env=_load_env("defaults", raw.get("env")),
+    )
+    _check_choice("defaults", "output_mode", defaults.output_mode, OUTPUT_MODES)
+    _check_choice(
+        "defaults", "inline_on_large_output",
+        defaults.inline_on_large_output, INLINE_ON_LARGE_OUTPUT_MODES,
+    )
+    return defaults
+
+
 def load_config(path: str | Path) -> ServerSpec:
     with open(path, encoding="utf-8") as fp:
         raw = yaml.safe_load(fp)
@@ -308,28 +353,14 @@ def load_config(path: str | Path) -> ServerSpec:
         name=server_raw["name"],
         description=server_raw.get("description", ""),
     )
-    defaults_raw = raw.get("defaults") or {}
-    if not isinstance(defaults_raw, dict):
-        raise ConfigError("'defaults' must be a mapping")
-    unknown_defaults = set(defaults_raw) - {"output_mode", "env"}
-    if unknown_defaults:
-        raise ConfigError(f"defaults: unknown keys {sorted(unknown_defaults)}")
-    default_env = _load_env("defaults", defaults_raw.get("env"))
-    default_output_mode = defaults_raw.get("output_mode", "inline")
-    if default_output_mode not in OUTPUT_MODES:
-        raise ConfigError(
-            f"defaults.output_mode must be one of {sorted(OUTPUT_MODES)}, "
-            f"got {default_output_mode!r}"
-        )
+    defaults = _load_defaults(raw.get("defaults"))
     tools_raw = raw.get("tools") or []
     if not isinstance(tools_raw, list):
         raise ConfigError("'tools' must be a list")
     for tool_raw in tools_raw:
         if not isinstance(tool_raw, dict):
             raise ConfigError("each tools entry must be a mapping")
-        tool = _load_tool(
-            tool_raw, default_output_mode=default_output_mode, default_env=default_env,
-        )
+        tool = _load_tool(tool_raw, defaults=defaults)
         if tool.name in server.tools:
             raise ConfigError(f"duplicate tool name: {tool.name}")
         server.tools[tool.name] = tool
@@ -478,14 +509,14 @@ def _write_output_file(tool: ToolSpec, data: bytes, out_dir: Path) -> Path:
 
 def _file_reply(data: bytes, path: Path, reason: str = "") -> str:
     """全量ファイルへの参照+抜粋だけを返す (呼び出し側 context の節約)。"""
-    head = data[:SPILL_EXCERPT_BYTES].decode("utf-8", errors="replace")
-    tail = data[-SPILL_EXCERPT_BYTES:].decode("utf-8", errors="replace")
+    head = data[:FILE_EXCERPT_BYTES].decode("utf-8", errors="replace")
+    tail = data[-FILE_EXCERPT_BYTES:].decode("utf-8", errors="replace")
     return (
         f"[cliwrap: output is {len(data)} bytes{reason}; full output saved to file]\n"
         f"file: {path}\n"
         f"Do not read it whole: use Read with offset/limit, or grep, to inspect parts.\n"
-        f"--- head ({SPILL_EXCERPT_BYTES} bytes) ---\n{head}\n"
-        f"--- tail ({SPILL_EXCERPT_BYTES} bytes) ---\n{tail}"
+        f"--- head ({FILE_EXCERPT_BYTES} bytes) ---\n{head}\n"
+        f"--- tail ({FILE_EXCERPT_BYTES} bytes) ---\n{tail}"
     )
 
 
@@ -494,8 +525,12 @@ def _overflow_to_file(tool: ToolSpec, data: bytes, file_dir: Path) -> str:
         path = _write_output_file(tool, data, file_dir)
     except OSError as exc:
         print(f"cliwrap: file output failed ({exc}); falling back to truncate", file=sys.stderr)
-        return _truncate(data, tool.max_output_bytes)
-    return _file_reply(data, path, reason=f" (> {tool.max_output_bytes})")
+        return _truncate(data, tool.inline_max_output_bytes)
+    return _file_reply(data, path, reason=f" (> {tool.inline_max_output_bytes})")
+
+
+def _stderr_tail(stderr: bytes) -> str:
+    return stderr[-STDERR_TAIL_BYTES:].decode("utf-8", errors="replace")
 
 
 def _exec_env(tool: ToolSpec) -> dict[str, str] | None:
@@ -526,26 +561,35 @@ def run_sync(
         return f"error: command timed out after {tool.timeout_sec}s: {argv!r}"
     except OSError as exc:
         return f"error: failed to execute {argv!r}: {exc}"
+    # per-call 指定 (output_dir) または file mode では、成否・サイズに関係なく
+    # 常に全量をファイル化する (証跡: 失敗した実行も記録に残す)
+    dest = output_dir if output_dir is not None else (
+        file_dir if tool.output_mode == "file" else None
+    )
+    if dest is not None:
+        try:
+            path = _write_output_file(tool, proc.stdout, dest)
+        except OSError as exc:
+            return f"error: failed to write output to {dest}: {exc}"
+        if proc.returncode != 0:
+            return (
+                f"error: command exited with code {proc.returncode}\n"
+                f"output saved to: {path}\n"
+                f"stderr (tail):\n{_stderr_tail(proc.stderr)}"
+            )
+        return _file_reply(proc.stdout, path)
     if proc.returncode != 0:
-        stderr_tail = proc.stderr[-STDERR_TAIL_BYTES:].decode("utf-8", errors="replace")
         return (
             f"error: command exited with code {proc.returncode}\n"
-            f"stderr (tail):\n{stderr_tail}"
+            f"stderr (tail):\n{_stderr_tail(proc.stderr)}"
         )
-    if output_dir is not None:
-        # 呼び出し側が明示した保存先へ、サイズに関係なく必ず全量を書く
-        try:
-            path = _write_output_file(tool, proc.stdout, output_dir)
-        except OSError as exc:
-            return f"error: failed to write output to {output_dir}: {exc}"
-        return _file_reply(proc.stdout, path)
     if (
-        len(proc.stdout) > tool.max_output_bytes
-        and tool.output_mode == "file"
+        len(proc.stdout) > tool.inline_max_output_bytes
+        and tool.inline_on_large_output == "file"
         and file_dir is not None
     ):
         return _overflow_to_file(tool, proc.stdout, file_dir)
-    return _truncate(proc.stdout, tool.max_output_bytes)
+    return _truncate(proc.stdout, tool.inline_max_output_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -808,7 +852,7 @@ def register_job_tool(mcp, tool: ToolSpec, jobs: JobManager) -> None:
 
     def result_fn(job_id: str) -> str:
         try:
-            return jobs.result(job_id, tool.max_output_bytes)
+            return jobs.result(job_id, tool.inline_max_output_bytes)
         except ParamValidationError as exc:
             return f"error: {exc}"
 

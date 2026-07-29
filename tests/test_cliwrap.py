@@ -491,7 +491,7 @@ class RunSyncTest(unittest.TestCase):
 
     def test_output_truncated_with_note(self):
         tool = self.tool(
-            [sys.executable, "-c", "print('x' * 1000)"], max_output_bytes=100,
+            [sys.executable, "-c", "print('x' * 1000)"], inline_max_output_bytes=100,
         )
         out = cliwrap.run_sync(tool, tool.argv)
         self.assertIn("output truncated at 100 bytes", out)
@@ -526,15 +526,17 @@ class FileOutputModeTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def tool(self, output_mode="file", max_output_bytes=100) -> cliwrap.ToolSpec:
+    def tool(self, output_mode="file", inline_max_output_bytes=100, argv=None,
+             inline_on_large_output="truncate") -> cliwrap.ToolSpec:
         return cliwrap.ToolSpec(
             name="t", description="",
-            argv=[sys.executable, "-c", "print('x' * 1000)"],
-            max_output_bytes=max_output_bytes,
+            argv=argv or [sys.executable, "-c", "print('x' * 1000)"],
+            inline_max_output_bytes=inline_max_output_bytes,
             output_mode=output_mode,
+            inline_on_large_output=inline_on_large_output,
         )
 
-    def test_overflow_writes_file_holding_full_output(self):
+    def test_file_mode_writes_file_holding_full_output(self):
         tool = self.tool()
         out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("full output saved to file", out)
@@ -546,16 +548,44 @@ class FileOutputModeTest(unittest.TestCase):
         self.assertIn(str(files[0]), out)  # 絶対パスが返り値に含まれる
         self.assertEqual(b"x" * 1000 + b"\n", files[0].read_bytes())  # 全量・無切り詰め
 
-    def test_under_limit_stays_inline(self):
-        tool = self.tool(max_output_bytes=5000)
+    def test_file_mode_writes_even_small_output(self):
+        # file mode は証跡目的なので、上限以下でも常にファイル化する
+        tool = self.tool(inline_max_output_bytes=5000)
         out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
-        self.assertEqual("x" * 1000 + "\n", out)  # 従来どおり本文をそのまま返す
-        self.assertFalse(self.file_dir.exists())
+        self.assertIn("full output saved to file", out)
+        self.assertEqual(1, len(list(self.file_dir.iterdir())))
 
-    def test_inline_mode_never_writes_file(self):
+    def test_file_mode_writes_on_failure_too(self):
+        tool = self.tool(
+            argv=[sys.executable, "-c",
+                  "import sys; print('partial'); sys.stderr.write('boom'); sys.exit(3)"],
+        )
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        self.assertIn("exited with code 3", out)
+        self.assertIn("output saved to:", out)
+        self.assertIn("boom", out)
+        files = list(self.file_dir.iterdir())
+        self.assertEqual(1, len(files))  # 失敗した実行も証跡が残る
+
+    def test_inline_truncate_never_writes_file(self):
         tool = self.tool(output_mode="inline")
         out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("output truncated at 100 bytes", out)
+        self.assertFalse(self.file_dir.exists())
+
+    def test_inline_on_large_output_file_writes_only_on_overflow(self):
+        tool = self.tool(output_mode="inline", inline_on_large_output="file")
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        self.assertIn("full output saved to file", out)  # 超過 → ファイル化 (旧 spill)
+        self.assertEqual(1, len(list(self.file_dir.iterdir())))
+
+    def test_inline_on_large_output_file_stays_inline_under_limit(self):
+        tool = self.tool(
+            output_mode="inline", inline_on_large_output="file",
+            inline_max_output_bytes=5000,
+        )
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        self.assertEqual("x" * 1000 + "\n", out)
         self.assertFalse(self.file_dir.exists())
 
     def test_file_mode_without_dir_falls_back_to_truncate(self):
@@ -587,6 +617,37 @@ class OutputModeConfigTest(unittest.TestCase):
     def test_default_is_inline(self):
         spec = load_yaml(MINIMAL)
         self.assertEqual("inline", spec.tools["echo"].output_mode)
+        self.assertEqual("truncate", spec.tools["echo"].inline_on_large_output)
+
+    def test_invalid_inline_on_large_output_is_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "inline_on_large_output"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - {name: x, argv: ["true"], inline_on_large_output: spill}\n'
+            )
+
+    def test_inline_settings_inherited_from_defaults(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'defaults: {inline_on_large_output: file, inline_max_output_bytes: 123}\n'
+            'tools:\n'
+            '  - {name: a, argv: ["true"]}\n'
+            '  - {name: b, argv: ["true"], inline_on_large_output: truncate}\n'
+        )
+        self.assertEqual("file", spec.tools["a"].inline_on_large_output)
+        self.assertEqual(123, spec.tools["a"].inline_max_output_bytes)
+        self.assertEqual("truncate", spec.tools["b"].inline_on_large_output)
+
+    def test_inline_keys_allowed_on_file_mode_tool(self):
+        # file mode では inline_* は使われないが、defaults 運用のためエラーにしない
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'defaults: {inline_on_large_output: file}\n'
+            'tools:\n'
+            '  - {name: x, argv: ["true"], output_mode: file, inline_max_output_bytes: 10}\n'
+        )
+        self.assertEqual("file", spec.tools["x"].output_mode)
 
     def test_unknown_defaults_key_is_error(self):
         with self.assertRaisesRegex(cliwrap.ConfigError, "defaults"):
@@ -794,7 +855,7 @@ class OutputDirTest(unittest.TestCase):
             'tools:\n'
             '  - name: big\n'
             '    description: big\n'
-            '    max_output_bytes: 100\n'
+            '    inline_max_output_bytes: 100\n'
             f'    argv: ["{sys.executable}", "-c", "print(\'x\' * 1000)"]\n'
         )
         server = cliwrap.build_server(spec, cache_dir=Path(self._tmp.name))
@@ -819,7 +880,7 @@ class JobModeTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.jobs = cliwrap.JobManager("testsrv", cache_dir=Path(self._tmp.name))
         self.tool = cliwrap.ToolSpec(
-            name="j", description="", argv=[], mode="job", max_output_bytes=10_000,
+            name="j", description="", argv=[], mode="job", inline_max_output_bytes=10_000,
         )
 
     def tearDown(self):
@@ -851,7 +912,7 @@ class JobModeTest(unittest.TestCase):
         status = self.jobs.status(job_id)
         self.assertIn("exited", status)
         self.assertIn("job-out", status)
-        result = self.jobs.result(job_id, self.tool.max_output_bytes)
+        result = self.jobs.result(job_id, self.tool.inline_max_output_bytes)
         self.assertIn("job-out", result)
         jdir = self.jobs.jobs_dir / job_id
         for name in ("stdout.log", "stderr.log", "pid", "meta.json", "exit_code"):

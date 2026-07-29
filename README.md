@@ -52,9 +52,10 @@ Safety is the core of this engine, enforced at execution and load time:
   reference undefined parameters.
 - **stdout is protocol-only.** The MCP stdio channel is never polluted; all engine
   logging goes to stderr.
-- **Bounded output.** Tool output is truncated at `max_output_bytes` by default
-  (`output_mode: inline`); `output_mode: file` writes outputs above the limit to a
-  file in full and returns only the path plus head/tail excerpts. Callers can also
+- **Bounded output.** Inline tool output is truncated at `inline_max_output_bytes`
+  by default; `inline_on_large_output: file` diverts oversized output to a file
+  (path plus head/tail excerpts), and `output_mode: file` always writes the full
+  output to a file — success or failure — for audit-trail use. Callers can also
   pass the auto-injected `output_dir` parameter to force the full stdout into a
   file of their choosing.
 - **Job isolation.** Background job IDs are strictly format-checked, blocking path
@@ -133,6 +134,8 @@ Top level:
 | `server.name` | yes | MCP server name. |
 | `server.description` | no | Served as the MCP `instructions`. |
 | `defaults.output_mode` | no | Default output mode for all tools: `inline` (default) or `file` (see per-tool `output_mode`). |
+| `defaults.inline_max_output_bytes` | no | Default inline size limit for all tools. |
+| `defaults.inline_on_large_output` | no | Default overflow behavior for all tools: `truncate` (default) or `file`. |
 | `defaults.env` | no | Environment variables forced for every tool (mapping of `VAR_NAME` → string; quote numbers). Merged over the inherited environment at execution time, so config values always win. |
 | `tools` | yes | List of tool definitions (at least one). |
 
@@ -145,8 +148,9 @@ Per tool:
 | `argv` | yes | — | Non-empty list of strings. `{param}` placeholders are substituted after validation; each element stays a single argv entry. |
 | `mode` | no | `sync` | `sync` (run and return) or `job` (background, see below). |
 | `timeout_sec` | no | `60` | Sync-mode timeout. |
-| `max_output_bytes` | no | `50000` | Output size limit returned inline. |
-| `output_mode` | no | inherits `defaults` | How output above `max_output_bytes` is returned. `inline`: truncated at the limit (excess is lost). `file`: written to a file in full, reply carries the path plus head/tail excerpts. Output at or below the limit is always returned inline in full. |
+| `output_mode` | no | inherits `defaults` | `inline`: output is returned in the reply, subject to `inline_max_output_bytes`. `file`: output is **always** written to a file in full — success or failure, any size — and the reply carries the path plus head/tail excerpts (audit trail). |
+| `inline_max_output_bytes` | no | `50000` | Inline size limit (`output_mode: inline` only; also caps job `_result` tails). |
+| `inline_on_large_output` | no | inherits `defaults` | What happens when inline output exceeds the limit: `truncate` (default; excess is lost) or `file` (full output goes to a file, reply carries path plus excerpts). |
 | `params` | no | `{}` | Mapping of parameter name → spec. |
 | `env` | no | `{}` | Environment variables forced for this tool. Merged over `defaults.env` (tool wins), then over the inherited environment at execution time. |
 
@@ -194,7 +198,7 @@ with `CLI_MCP_CACHE_DIR`).
 
 - `<name>_start` — starts the command detached (own process group), returns a `job_id`
 - `<name>_status` — running/exited state plus stdout/stderr tails
-- `<name>_result` — final output (tail-limited by `max_output_bytes`)
+- `<name>_result` — final output (tail-limited by `inline_max_output_bytes`)
 - `<name>_cancel` — SIGTERM to the whole process group
 
 Job logs and metadata persist under the cache dir, so finished jobs remain
