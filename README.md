@@ -149,10 +149,10 @@ Per tool:
 | `argv` | yes | — | Non-empty list of strings. `{param}` placeholders are substituted after validation; each element stays a single argv entry. |
 | `mode` | no | `sync` | `sync` (run and return) or `job` (background, see below). |
 | `timeout_sec` | no | `60` | Sync-mode timeout. |
-| `output_mode` | no | inherits `defaults` | `inline`: output is returned in the reply, subject to `inline_max_output_bytes`. `file`: output is **always** written to a file in full — success or failure, any size — and the reply carries the path plus head/tail excerpts (audit trail). |
-| `inline_max_output_bytes` | no | `50000` | Inline size limit (`output_mode: inline` only; also caps job `_result` tails). |
-| `inline_on_large_output` | no | inherits `defaults` | What happens when inline output exceeds the limit: `truncate` (default; excess is lost) or `file` (full output goes to a file, reply carries path plus excerpts). |
-| `file_output_dir` | no | inherits `defaults` | Output root for this tool (absolute path). File outputs go to `<root>/outputs/`, job state to `<root>/jobs/`, so all traces of a tool accumulate under one configured location. Unset: the cache dir. |
+| `output_mode` | no | inherits `defaults` (`inline`) | `inline`: output is returned in the reply, subject to `inline_max_output_bytes`. `file`: output is **always** written to a file in full — success or failure, any size — and the reply carries the path plus head/tail excerpts (audit trail). |
+| `inline_max_output_bytes` | no | inherits `defaults` (`50000`) | Inline size limit (`output_mode: inline` only; also caps job `_result` tails). |
+| `inline_on_large_output` | no | inherits `defaults` (`truncate`) | What happens when inline output exceeds the limit: `truncate` (excess is lost) or `file` (full output goes to a file, reply carries path plus excerpts). |
+| `file_output_dir` | no | inherits `defaults` (cache dir) | Output root for this tool (absolute path). File outputs go to `<root>/outputs/`, job state to `<root>/jobs/`, so all traces of a tool accumulate under one configured location. |
 | `params` | no | `{}` | Mapping of parameter name → spec. |
 | `env` | no | `{}` | Environment variables forced for this tool. Merged over `defaults.env` (tool wins), then over the inherited environment at execution time. |
 
