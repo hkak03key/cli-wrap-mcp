@@ -34,6 +34,10 @@ tools:
     # The forced flag comes AFTER {args} so it overrides anything the model sent.
     argv: ["gcloud", "{args}", "--project=my-project"]
     timeout_sec: 120
+    # file mode: every invocation (including failures) is saved in full under
+    # <root>/outputs/<tool>-<id>/ with argv metadata — an audit trail of what ran.
+    # Pin the root with file_output_dir; unset, it goes to the cache dir.
+    # file_output_dir: /var/log/cli-wrap-mcp/gcloud
     output_mode: file
     env:
       CLOUDSDK_CORE_PROJECT: my-project
