@@ -5,7 +5,9 @@
 
 設計原則 (安全性がこの仕組みの核):
 - 実行は常に shell=False の argv 配列。シェル文字列連結の経路は存在しない
-- パラメータ値は検証 (type / pattern fullmatch / enum) を通過してから argv 要素に埋め込む
+- パラメータ値は検証 (type / pattern fullmatch / deny_pattern / enum) を通過してから
+  argv 要素に埋め込む。array param は要素全体の placeholder のみに展開を許し、
+  各 item に同じ検証を適用する
 - 引数インジェクション対策: `-` で始まる値は既定で拒否 (per-param の
   allow_dash_prefix = true で明示的に許可可能)
 - config ロード時に argv 内の未定義プレースホルダはエラー
@@ -39,11 +41,21 @@ ON_LARGE_OUTPUT_MODES = {"truncate", "spill"}
 
 PARAM_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # エンジンが全 sync ツールに自動注入するパラメータ名 (config での定義は禁止)
 RESERVED_PARAM_NAMES = {"output_dir"}
 
+# scalar 型の Python 型 (enum / default の型検査に使用)。array は別扱い (items は常に str)
 PY_TYPES: dict[str, type] = {"string": str, "integer": int, "boolean": bool}
+
+# exec 生成する関数シグネチャの型注釈 (このキー集合が合法な param type の全て)
+ANNOTATIONS: dict[str, str] = {
+    "string": "str",
+    "integer": "int",
+    "boolean": "bool",
+    "array": "list[str]",
+}
 
 
 class ConfigError(Exception):
@@ -61,6 +73,7 @@ class ParamSpec:
     description: str = ""
     required: bool = True
     pattern: str | None = None
+    deny_pattern: str | None = None
     enum: list[Any] | None = None
     default: Any = None
     allow_dash_prefix: bool = False
@@ -80,6 +93,7 @@ class ToolSpec:
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
     on_large_output: str = "truncate"
     params: dict[str, ParamSpec] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -125,10 +139,11 @@ def _load_param(tool_name: str, pname: str, raw: dict[str, Any]) -> ParamSpec:
             f"{ctx}: param name {pname!r} is reserved (injected by the engine)"
         )
     ptype = raw.get("type", "string")
-    if ptype not in PY_TYPES:
-        raise ConfigError(f"{ctx}: unknown type {ptype!r} (expected one of {sorted(PY_TYPES)})")
+    if ptype not in ANNOTATIONS:
+        raise ConfigError(f"{ctx}: unknown type {ptype!r} (expected one of {sorted(ANNOTATIONS)})")
     unknown = set(raw) - {
-        "type", "description", "required", "pattern", "enum", "default", "allow_dash_prefix",
+        "type", "description", "required", "pattern", "deny_pattern", "enum", "default",
+        "allow_dash_prefix",
     }
     if unknown:
         raise ConfigError(f"{ctx}: unknown keys {sorted(unknown)}")
@@ -138,17 +153,33 @@ def _load_param(tool_name: str, pname: str, raw: dict[str, Any]) -> ParamSpec:
         description=raw.get("description", ""),
         required=raw.get("required", True),
         pattern=raw.get("pattern"),
+        deny_pattern=raw.get("deny_pattern"),
         enum=raw.get("enum"),
         default=raw.get("default"),
         allow_dash_prefix=raw.get("allow_dash_prefix", False),
     )
-    if spec.pattern is not None:
-        if spec.type != "string":
-            raise ConfigError(f"{ctx}: pattern is only supported for string params")
+    for attr in ("pattern", "deny_pattern"):
+        regex = getattr(spec, attr)
+        if regex is None:
+            continue
+        if spec.type not in ("string", "array"):
+            raise ConfigError(f"{ctx}: {attr} is only supported for string/array params")
         try:
-            re.compile(spec.pattern)
+            re.compile(regex)
         except re.error as exc:
-            raise ConfigError(f"{ctx}: invalid pattern: {exc}") from exc
+            raise ConfigError(f"{ctx}: invalid {attr}: {exc}") from exc
+    if spec.type == "array":
+        # array の enum / pattern / deny_pattern / dash guard は各 item (常に str) に適用
+        if spec.enum is not None and not all(isinstance(i, str) for i in spec.enum):
+            raise ConfigError(f"{ctx}: enum values for array params must be strings")
+        if spec.default is not None and (
+            not isinstance(spec.default, list)
+            or not all(isinstance(i, str) for i in spec.default)
+        ):
+            raise ConfigError(f"{ctx}: default for array params must be a list of strings")
+        if not spec.required and spec.default is None:
+            spec.default = []  # 空展開 (0 要素) は well-defined なので暗黙 default にできる
+        return spec
     py_type = PY_TYPES[spec.type]
     if spec.enum is not None:
         for item in spec.enum:
@@ -162,14 +193,38 @@ def _load_param(tool_name: str, pname: str, raw: dict[str, Any]) -> ParamSpec:
     return spec
 
 
-def _load_tool(raw: dict[str, Any], default_on_large_output: str = "truncate") -> ToolSpec:
+def _load_env(ctx: str, raw: Any) -> dict[str, str]:
+    """`env:` セクション (環境変数名 -> 値) を検証して返す。"""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{ctx}: env must be a mapping of VAR_NAME -> string")
+    env: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not ENV_NAME_RE.match(key):
+            raise ConfigError(
+                f"{ctx}: invalid env var name {key!r} (must match {ENV_NAME_RE.pattern})"
+            )
+        if not isinstance(value, str):
+            raise ConfigError(
+                f"{ctx}: env value for {key!r} must be a string (quote numbers in YAML)"
+            )
+        env[key] = value
+    return env
+
+
+def _load_tool(
+    raw: dict[str, Any],
+    default_on_large_output: str = "truncate",
+    default_env: dict[str, str] | None = None,
+) -> ToolSpec:
     name = raw.get("name")
     if not name or not isinstance(name, str) or not TOOL_NAME_RE.match(name):
         raise ConfigError(f"tools[].name is required and must match {TOOL_NAME_RE.pattern}: {name!r}")
     ctx = f"tools.{name}"
     unknown = set(raw) - {
         "name", "description", "argv", "mode", "timeout_sec", "max_output_bytes",
-        "on_large_output", "params",
+        "on_large_output", "params", "env",
     }
     if unknown:
         raise ConfigError(f"{ctx}: unknown keys {sorted(unknown)}")
@@ -202,14 +257,26 @@ def _load_tool(raw: dict[str, Any], default_on_large_output: str = "truncate") -
         max_output_bytes=raw.get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES),
         on_large_output=on_large_output,
         params=params,
+        # tool の env は server 全体の defaults.env の上にマージ (同名キーは tool 側が勝つ)
+        env={**(default_env or {}), **_load_env(ctx, raw.get("env"))},
     )
 
     referenced: set[str] = set()
     for element in tool.argv:
         try:
-            referenced.update(_placeholders(element))
+            names = _placeholders(element)
         except ConfigError as exc:
             raise ConfigError(f"{ctx}: {exc}") from exc
+        referenced.update(names)
+        # array param は N 要素に展開されるため、要素全体が placeholder のときだけ許可
+        # ("--x={args}" のような埋め込みは 1 要素に潰れてしまい意味が壊れる)
+        for n in names:
+            pspec = params.get(n)
+            if pspec is not None and pspec.type == "array" and element != "{" + n + "}":
+                raise ConfigError(
+                    f"{ctx}: array param {n!r} placeholder must be the entire "
+                    f"argv element, got {element!r}"
+                )
     undefined = referenced - set(params)
     if undefined:
         raise ConfigError(f"{ctx}: undefined placeholders in argv: {sorted(undefined)}")
@@ -241,9 +308,10 @@ def load_config(path: str | Path) -> ServerSpec:
     defaults_raw = raw.get("defaults") or {}
     if not isinstance(defaults_raw, dict):
         raise ConfigError("'defaults' must be a mapping")
-    unknown_defaults = set(defaults_raw) - {"on_large_output"}
+    unknown_defaults = set(defaults_raw) - {"on_large_output", "env"}
     if unknown_defaults:
         raise ConfigError(f"defaults: unknown keys {sorted(unknown_defaults)}")
+    default_env = _load_env("defaults", defaults_raw.get("env"))
     default_olo = defaults_raw.get("on_large_output", "truncate")
     if default_olo not in ON_LARGE_OUTPUT_MODES:
         raise ConfigError(
@@ -256,7 +324,7 @@ def load_config(path: str | Path) -> ServerSpec:
     for tool_raw in tools_raw:
         if not isinstance(tool_raw, dict):
             raise ConfigError("each tools entry must be a mapping")
-        tool = _load_tool(tool_raw, default_on_large_output=default_olo)
+        tool = _load_tool(tool_raw, default_on_large_output=default_olo, default_env=default_env)
         if tool.name in server.tools:
             raise ConfigError(f"duplicate tool name: {tool.name}")
         server.tools[tool.name] = tool
@@ -280,8 +348,39 @@ def load_config(path: str | Path) -> ServerSpec:
 # パラメータ検証と argv レンダリング
 # ---------------------------------------------------------------------------
 
-def validate_param(spec: ParamSpec, value: Any) -> str:
-    """値を検証し、argv 要素に埋め込む文字列表現を返す。"""
+def _validate_item(spec: ParamSpec, item: Any, index: int) -> str:
+    """array param の 1 item を検証する (enum / pattern / deny / dash guard は per-item)。"""
+    label = f"{spec.name!r}[{index}]"
+    if not isinstance(item, str):
+        raise ParamValidationError(
+            f"param {label}: expected string item, got {type(item).__name__}"
+        )
+    if spec.enum is not None and item not in spec.enum:
+        raise ParamValidationError(f"param {label}: value {item!r} is not in enum {spec.enum}")
+    if spec.pattern is not None and not re.fullmatch(spec.pattern, item):
+        raise ParamValidationError(
+            f"param {label}: value {item!r} does not match pattern {spec.pattern!r}"
+        )
+    if spec.deny_pattern is not None and re.fullmatch(spec.deny_pattern, item):
+        raise ParamValidationError(
+            f"param {label}: value {item!r} is denied by deny_pattern {spec.deny_pattern!r}"
+        )
+    if item.startswith("-") and not spec.allow_dash_prefix:
+        raise ParamValidationError(
+            f"param {label}: value starting with '-' is rejected "
+            "(set allow_dash_prefix = true in config to allow)"
+        )
+    return item
+
+
+def validate_param(spec: ParamSpec, value: Any) -> str | list[str]:
+    """値を検証し、argv に埋め込む文字列表現 (array param は item リスト) を返す。"""
+    if spec.type == "array":
+        if not isinstance(value, list):
+            raise ParamValidationError(
+                f"param {spec.name!r}: expected array of strings, got {type(value).__name__}"
+            )
+        return [_validate_item(spec, item, i) for i, item in enumerate(value)]
     py_type = PY_TYPES[spec.type]
     if not isinstance(value, py_type) or (py_type is int and isinstance(value, bool)):
         raise ParamValidationError(
@@ -294,6 +393,11 @@ def validate_param(spec: ParamSpec, value: Any) -> str:
     if spec.pattern is not None and not re.fullmatch(spec.pattern, value):
         raise ParamValidationError(
             f"param {spec.name!r}: value {value!r} does not match pattern {spec.pattern!r}"
+        )
+    if spec.deny_pattern is not None and re.fullmatch(spec.deny_pattern, value):
+        raise ParamValidationError(
+            f"param {spec.name!r}: value {value!r} is denied by "
+            f"deny_pattern {spec.deny_pattern!r}"
         )
     if spec.type == "boolean":
         rendered = "true" if value else "false"
@@ -309,8 +413,11 @@ def validate_param(spec: ParamSpec, value: Any) -> str:
 
 
 def render_argv(tool: ToolSpec, arguments: dict[str, Any]) -> list[str]:
-    """検証済みパラメータで argv テンプレートを埋め、実行可能な argv を返す。"""
-    rendered_params: dict[str, str] = {}
+    """検証済みパラメータで argv テンプレートを埋め、実行可能な argv を返す。
+
+    array param は placeholder 単独の要素を N 要素に展開する (0 要素も可)。
+    """
+    rendered_params: dict[str, str | list[str]] = {}
     for pname, spec in tool.params.items():
         if pname in arguments and arguments[pname] is not None:
             value = arguments[pname]
@@ -328,7 +435,18 @@ def render_argv(tool: ToolSpec, arguments: dict[str, Any]) -> list[str]:
         if not names:
             argv.append(element)
             continue
-        argv.append(element.format(**{n: rendered_params[n] for n in names}))
+        values = {n: rendered_params[n] for n in names}
+        list_names = [n for n, v in values.items() if isinstance(v, list)]
+        if list_names:
+            # ロード時に検証済みだが、ToolSpec 直組みに対する防御として再確認する
+            name = list_names[0]
+            if len(names) != 1 or element != "{" + name + "}":
+                raise ParamValidationError(
+                    f"param {name!r}: array value must fill an entire argv element"
+                )
+            argv.extend(values[name])
+            continue
+        argv.append(element.format(**values))
     return argv
 
 
@@ -375,6 +493,16 @@ def _spill_output(tool: ToolSpec, data: bytes, spill_dir: Path) -> str:
     return _file_reply(data, path, reason=f" (> {tool.max_output_bytes})")
 
 
+def _exec_env(tool: ToolSpec) -> dict[str, str] | None:
+    """config の env 強制を反映した実行環境を返す (強制なしなら None = 親環境継承)。
+
+    継承環境の上にマージするので、同名の変数は config 側が常に勝つ。
+    """
+    if not tool.env:
+        return None
+    return {**os.environ, **tool.env}
+
+
 def run_sync(
     tool: ToolSpec,
     argv: list[str],
@@ -387,6 +515,7 @@ def run_sync(
             shell=False,
             capture_output=True,
             timeout=tool.timeout_sec,
+            env=_exec_env(tool),
         )
     except subprocess.TimeoutExpired:
         return f"error: command timed out after {tool.timeout_sec}s: {argv!r}"
@@ -470,6 +599,7 @@ class JobManager:
                     stdout=out_fp,
                     stderr=err_fp,
                     start_new_session=True,  # cancel で process group ごと止めるため
+                    env=_exec_env(tool),
                 )
             except OSError as exc:
                 return f"error: failed to start {argv!r}: {exc}"
@@ -575,11 +705,14 @@ def _make_tool_fn(fn_name: str, tool: ToolSpec, invoke, inject_output_dir: bool 
     required_args: list[str] = []
     optional_args: list[str] = []
     for pname, spec in tool.params.items():
-        ann = PY_TYPES[spec.type].__name__
-        if spec.has_default or not spec.required:
-            optional_args.append(f"{pname}: {ann} = {spec.default!r}")
-        else:
+        ann = ANNOTATIONS[spec.type]
+        if not (spec.has_default or not spec.required):
             required_args.append(f"{pname}: {ann}")
+        elif spec.type == "array":
+            # mutable default を避けて None を sentinel にする (render_argv が default に解決)
+            optional_args.append(f"{pname}: list[str] | None = None")
+        else:
+            optional_args.append(f"{pname}: {ann} = {spec.default!r}")
     if inject_output_dir:
         optional_args.append("output_dir: str | None = None")
     signature = ", ".join(required_args + optional_args)
@@ -703,7 +836,7 @@ def register_job_tool(mcp, tool: ToolSpec, jobs: JobManager) -> None:
 def _tool_description(tool: ToolSpec) -> str:
     lines = [tool.description or tool.name]
     for pname, spec in tool.params.items():
-        parts = [spec.type]
+        parts = ["array of strings" if spec.type == "array" else spec.type]
         if not spec.required or spec.has_default:
             parts.append(f"optional, default={spec.default!r}")
         if spec.enum is not None:

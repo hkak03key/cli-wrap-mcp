@@ -58,6 +58,12 @@ Safety is the core of this engine, enforced at execution and load time:
   `output_dir` parameter to force the full stdout into a file of their choosing.
 - **Job isolation.** Background job IDs are strictly format-checked, blocking path
   traversal through `job_id`.
+- **Guardrails, not a sandbox.** For "arbitrary subcommand" tools (an `array` param
+  with `allow_dash_prefix: true`), `deny_pattern`, forced trailing flags, and `env`
+  forcing constrain what the model can do — but a determined CLI often has more than
+  one spelling for the same effect. Treat them as accident prevention and put the
+  real security boundary in the credentials the wrapped CLI runs with (see
+  [`examples/gcloud.yml`](examples/gcloud.yml)).
 
 Trust model: the YAML config is a trusted local file (it decides *which* binaries
 can run); the tool *arguments* coming from the model are untrusted and constrained
@@ -83,6 +89,10 @@ Try the bundled examples:
 ```sh
 uvx cli-wrap-mcp@0.1.0 --config examples/echo.yml
 ```
+
+[`examples/gcloud.yml`](examples/gcloud.yml) shows the "arbitrary subcommand with
+forced env vars and options" pattern (variadic `array` param + `deny_pattern` +
+`env` forcing).
 
 ### Claude Code
 
@@ -122,6 +132,7 @@ Top level:
 | `server.name` | yes | MCP server name. |
 | `server.description` | no | Served as the MCP `instructions`. |
 | `defaults.on_large_output` | no | Default large-output mode for all tools: `truncate` (default) or `spill`. |
+| `defaults.env` | no | Environment variables forced for every tool (mapping of `VAR_NAME` → string; quote numbers). Merged over the inherited environment at execution time, so config values always win. |
 | `tools` | yes | List of tool definitions (at least one). |
 
 Per tool:
@@ -136,18 +147,37 @@ Per tool:
 | `max_output_bytes` | no | `50000` | Output size limit returned inline. |
 | `on_large_output` | no | inherits `defaults` | `truncate` or `spill`. |
 | `params` | no | `{}` | Mapping of parameter name → spec. |
+| `env` | no | `{}` | Environment variables forced for this tool. Merged over `defaults.env` (tool wins), then over the inherited environment at execution time. |
 
 Per parameter (`params.<name>`):
 
 | Key | Required | Default | Description |
 |:----|:---------|:--------|:------------|
-| `type` | no | `string` | `string`, `integer`, or `boolean` (booleans render as `true`/`false`). |
+| `type` | no | `string` | `string`, `integer`, `boolean` (booleans render as `true`/`false`), or `array` (list of strings, see below). |
 | `description` | no | `""` | Shown in the tool schema. |
-| `required` | no | `true` | Optional parameters must have a `default` if referenced in argv. |
-| `pattern` | no | — | Regex, string params only, matched with `fullmatch`. |
-| `enum` | no | — | Allowed values (type-checked at load time). |
+| `required` | no | `true` | Optional parameters must have a `default` if referenced in argv (optional arrays implicitly default to `[]`). |
+| `pattern` | no | — | Regex allowlist, string/array params, matched with `fullmatch` (per item for arrays). |
+| `deny_pattern` | no | — | Regex blocklist, string/array params: a value that `fullmatch`es is rejected (per item for arrays). Combine with `allow_dash_prefix: true` to allow flags in general while blocking specific ones. |
+| `enum` | no | — | Allowed values (type-checked at load time; string items for arrays). |
 | `default` | no | — | Used when the argument is omitted (type-checked at load time). |
-| `allow_dash_prefix` | no | `false` | Permit values starting with `-` (off by default; injection guard). |
+| `allow_dash_prefix` | no | `false` | Permit values starting with `-` (off by default; injection guard). Applies per item for arrays. |
+
+### Array (variadic) parameters
+
+`type: array` accepts a list of strings and expands into that many argv elements —
+use it to pass a variable-length subcommand tail (`gcloud {args}`). Rules:
+
+- The placeholder must be an **entire argv element** (`"{args}"`); embedding it in a
+  larger element (`"--x={args}"`) is a load-time error, because the expansion would
+  collapse into one element and change meaning.
+- `pattern`, `deny_pattern`, `enum`, and the dash-prefix guard are applied to
+  **each item** individually; every item stays exactly one argv element (no shell,
+  no word splitting).
+- An empty list expands to zero elements. Optional arrays default to `[]` unless an
+  explicit `default` is given.
+- Fixed argv elements placed *after* the placeholder still apply, which lets a config
+  force trailing flags that override anything the model passed earlier (for
+  argparse-style CLIs the last occurrence of a flag wins).
 
 Parameter names must match `[a-z_][a-z0-9_]*` and must not be Python keywords.
 `output_dir` is **reserved**: the engine injects it into every sync tool as an
