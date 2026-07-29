@@ -34,17 +34,23 @@ from typing import Any
 import yaml
 
 DEFAULT_TIMEOUT_SEC = 60
-DEFAULT_MAX_OUTPUT_BYTES = 50_000
+DEFAULT_INLINE_MAX_OUTPUT_BYTES = 50_000
 STDERR_TAIL_BYTES = 2_000
-SPILL_EXCERPT_BYTES = 1_000
-ON_LARGE_OUTPUT_MODES = {"truncate", "spill"}
+FILE_EXCERPT_BYTES = 1_000
+# 出力の返し方:
+# - inline: 応答にそのまま含める。上限 (inline_max_output_bytes) 超過時の挙動は
+#           inline_on_large_output (truncate: 切り詰め / file: ファイルへ書き出し)
+# - file:   成否やサイズに関係なく常にファイルへ全量書き出し (証跡用途)、
+#           応答はパス + 抜粋のみ
+OUTPUT_MODES = {"inline", "file"}
+INLINE_ON_LARGE_OUTPUT_MODES = {"truncate", "file"}
 
 PARAM_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # エンジンが全 sync ツールに自動注入するパラメータ名 (config での定義は禁止)
-RESERVED_PARAM_NAMES = {"output_dir"}
+RESERVED_PARAM_NAMES = {"file_output_dir"}
 
 # scalar 型の Python 型 (enum / default の型検査に使用)。array は別扱い (items は常に str)
 PY_TYPES: dict[str, type] = {"string": str, "integer": int, "boolean": bool}
@@ -90,9 +96,21 @@ class ToolSpec:
     argv: list[str]
     mode: str = "sync"
     timeout_sec: int = DEFAULT_TIMEOUT_SEC
-    max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
-    on_large_output: str = "truncate"
+    inline_max_output_bytes: int = DEFAULT_INLINE_MAX_OUTPUT_BYTES
+    output_mode: str = "inline"
+    inline_on_large_output: str = "truncate"
+    file_output_dir: str | None = None
     params: dict[str, ParamSpec] = field(default_factory=dict)
+    env: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class Defaults:
+    """`defaults:` セクション (tool 側で未指定のときに使う server 全体の既定値)。"""
+    output_mode: str = "inline"
+    inline_max_output_bytes: int = DEFAULT_INLINE_MAX_OUTPUT_BYTES
+    inline_on_large_output: str = "truncate"
+    file_output_dir: str | None = None
     env: dict[str, str] = field(default_factory=dict)
 
 
@@ -193,6 +211,20 @@ def _load_param(tool_name: str, pname: str, raw: dict[str, Any]) -> ParamSpec:
     return spec
 
 
+def _check_choice(ctx: str, key: str, value: Any, allowed: set[str]) -> None:
+    if value not in allowed:
+        raise ConfigError(f"{ctx}: {key} must be one of {sorted(allowed)}, got {value!r}")
+
+
+def _load_file_output_dir(ctx: str, raw: Any) -> str | None:
+    """`file_output_dir:` (ファイル出力のルート) を検証して返す。"""
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.startswith("/"):
+        raise ConfigError(f"{ctx}: file_output_dir must be an absolute path, got {raw!r}")
+    return raw
+
+
 def _load_env(ctx: str, raw: Any) -> dict[str, str]:
     """`env:` セクション (環境変数名 -> 値) を検証して返す。"""
     if raw is None:
@@ -215,25 +247,23 @@ def _load_env(ctx: str, raw: Any) -> dict[str, str]:
 
 def _load_tool(
     raw: dict[str, Any],
-    default_on_large_output: str = "truncate",
-    default_env: dict[str, str] | None = None,
+    defaults: Defaults | None = None,
 ) -> ToolSpec:
+    defaults = defaults or Defaults()
     name = raw.get("name")
     if not name or not isinstance(name, str) or not TOOL_NAME_RE.match(name):
         raise ConfigError(f"tools[].name is required and must match {TOOL_NAME_RE.pattern}: {name!r}")
     ctx = f"tools.{name}"
     unknown = set(raw) - {
-        "name", "description", "argv", "mode", "timeout_sec", "max_output_bytes",
-        "on_large_output", "params", "env",
+        "name", "description", "argv", "mode", "timeout_sec", "inline_max_output_bytes",
+        "output_mode", "inline_on_large_output", "file_output_dir", "params", "env",
     }
     if unknown:
         raise ConfigError(f"{ctx}: unknown keys {sorted(unknown)}")
-    on_large_output = raw.get("on_large_output", default_on_large_output)
-    if on_large_output not in ON_LARGE_OUTPUT_MODES:
-        raise ConfigError(
-            f"{ctx}: on_large_output must be one of {sorted(ON_LARGE_OUTPUT_MODES)}, "
-            f"got {on_large_output!r}"
-        )
+    output_mode = raw.get("output_mode", defaults.output_mode)
+    _check_choice(ctx, "output_mode", output_mode, OUTPUT_MODES)
+    inline_on_large_output = raw.get("inline_on_large_output", defaults.inline_on_large_output)
+    _check_choice(ctx, "inline_on_large_output", inline_on_large_output, INLINE_ON_LARGE_OUTPUT_MODES)
     argv = raw.get("argv")
     if not argv or not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
         raise ConfigError(f"{ctx}: argv must be a non-empty list of strings")
@@ -254,11 +284,18 @@ def _load_tool(
         argv=list(argv),
         mode=mode,
         timeout_sec=raw.get("timeout_sec", DEFAULT_TIMEOUT_SEC),
-        max_output_bytes=raw.get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES),
-        on_large_output=on_large_output,
+        inline_max_output_bytes=raw.get(
+            "inline_max_output_bytes", defaults.inline_max_output_bytes,
+        ),
+        output_mode=output_mode,
+        inline_on_large_output=inline_on_large_output,
+        file_output_dir=(
+            _load_file_output_dir(ctx, raw.get("file_output_dir"))
+            or defaults.file_output_dir
+        ),
         params=params,
         # tool の env は server 全体の defaults.env の上にマージ (同名キーは tool 側が勝つ)
-        env={**(default_env or {}), **_load_env(ctx, raw.get("env"))},
+        env={**defaults.env, **_load_env(ctx, raw.get("env"))},
     )
 
     referenced: set[str] = set()
@@ -293,6 +330,34 @@ def _load_tool(
     return tool
 
 
+def _load_defaults(raw: Any) -> Defaults:
+    if raw is None:
+        return Defaults()
+    if not isinstance(raw, dict):
+        raise ConfigError("'defaults' must be a mapping")
+    unknown = set(raw) - {
+        "output_mode", "inline_max_output_bytes", "inline_on_large_output",
+        "file_output_dir", "env",
+    }
+    if unknown:
+        raise ConfigError(f"defaults: unknown keys {sorted(unknown)}")
+    defaults = Defaults(
+        output_mode=raw.get("output_mode", "inline"),
+        inline_max_output_bytes=raw.get(
+            "inline_max_output_bytes", DEFAULT_INLINE_MAX_OUTPUT_BYTES,
+        ),
+        inline_on_large_output=raw.get("inline_on_large_output", "truncate"),
+        file_output_dir=_load_file_output_dir("defaults", raw.get("file_output_dir")),
+        env=_load_env("defaults", raw.get("env")),
+    )
+    _check_choice("defaults", "output_mode", defaults.output_mode, OUTPUT_MODES)
+    _check_choice(
+        "defaults", "inline_on_large_output",
+        defaults.inline_on_large_output, INLINE_ON_LARGE_OUTPUT_MODES,
+    )
+    return defaults
+
+
 def load_config(path: str | Path) -> ServerSpec:
     with open(path, encoding="utf-8") as fp:
         raw = yaml.safe_load(fp)
@@ -305,26 +370,14 @@ def load_config(path: str | Path) -> ServerSpec:
         name=server_raw["name"],
         description=server_raw.get("description", ""),
     )
-    defaults_raw = raw.get("defaults") or {}
-    if not isinstance(defaults_raw, dict):
-        raise ConfigError("'defaults' must be a mapping")
-    unknown_defaults = set(defaults_raw) - {"on_large_output", "env"}
-    if unknown_defaults:
-        raise ConfigError(f"defaults: unknown keys {sorted(unknown_defaults)}")
-    default_env = _load_env("defaults", defaults_raw.get("env"))
-    default_olo = defaults_raw.get("on_large_output", "truncate")
-    if default_olo not in ON_LARGE_OUTPUT_MODES:
-        raise ConfigError(
-            f"defaults.on_large_output must be one of {sorted(ON_LARGE_OUTPUT_MODES)}, "
-            f"got {default_olo!r}"
-        )
+    defaults = _load_defaults(raw.get("defaults"))
     tools_raw = raw.get("tools") or []
     if not isinstance(tools_raw, list):
         raise ConfigError("'tools' must be a list")
     for tool_raw in tools_raw:
         if not isinstance(tool_raw, dict):
             raise ConfigError("each tools entry must be a mapping")
-        tool = _load_tool(tool_raw, default_on_large_output=default_olo, default_env=default_env)
+        tool = _load_tool(tool_raw, defaults=defaults)
         if tool.name in server.tools:
             raise ConfigError(f"duplicate tool name: {tool.name}")
         server.tools[tool.name] = tool
@@ -462,35 +515,65 @@ def _truncate(data: bytes, limit: int) -> str:
     return f"{truncated}\n[cliwrap: output truncated at {limit} bytes (total {len(data)} bytes)]"
 
 
-def _write_output_file(tool: ToolSpec, data: bytes, out_dir: Path) -> Path:
-    """stdout 全量を <out_dir>/<tool>-<id>.out に書く (OSError は呼び出し側で処理)。"""
-    out_dir.mkdir(parents=True, exist_ok=True)
+def _invocation_meta(
+    tool: ToolSpec,
+    argv: list[str],
+    started_at: str,
+    exit_code: int | None,
+    timed_out: bool = False,
+) -> dict[str, Any]:
+    meta: dict[str, Any] = {
+        "tool": tool.name,
+        "argv": argv,
+        "started_at": started_at,
+        "exit_code": exit_code,
+    }
+    if timed_out:
+        meta["timed_out"] = True
+    return meta
+
+
+def _write_invocation_dir(
+    tool: ToolSpec,
+    parent: Path,
+    stdout: bytes,
+    stderr: bytes,
+    meta: dict[str, Any],
+) -> Path:
+    """1 実行分の出力一式を <parent>/<tool>-<id>/ に書く (OSError は呼び出し側で処理)。
+
+    stdout.log / stderr.log / meta.json という構成で、job モードの job dir と
+    レイアウトを揃えている。meta.json (argv・時刻・exit code) があることで
+    「何を実行してこの出力が出たか」までが証跡として残る。
+    """
+    parent.mkdir(parents=True, exist_ok=True)
     name = time.strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
-    path = out_dir / f"{tool.name}-{name}.out"
-    path.write_bytes(data)
-    return path
+    inv_dir = parent / f"{tool.name}-{name}"
+    inv_dir.mkdir()
+    (inv_dir / "stdout.log").write_bytes(stdout)
+    (inv_dir / "stderr.log").write_bytes(stderr)
+    (inv_dir / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False), encoding="utf-8",
+    )
+    return inv_dir
 
 
-def _file_reply(data: bytes, path: Path, reason: str = "") -> str:
+def _file_reply(data: bytes, inv_dir: Path, reason: str = "") -> str:
     """全量ファイルへの参照+抜粋だけを返す (呼び出し側 context の節約)。"""
-    head = data[:SPILL_EXCERPT_BYTES].decode("utf-8", errors="replace")
-    tail = data[-SPILL_EXCERPT_BYTES:].decode("utf-8", errors="replace")
+    head = data[:FILE_EXCERPT_BYTES].decode("utf-8", errors="replace")
+    tail = data[-FILE_EXCERPT_BYTES:].decode("utf-8", errors="replace")
     return (
         f"[cliwrap: output is {len(data)} bytes{reason}; full output saved to file]\n"
-        f"file: {path}\n"
+        f"file: {inv_dir / 'stdout.log'}\n"
+        f"(stderr.log and meta.json with the executed argv are in the same directory)\n"
         f"Do not read it whole: use Read with offset/limit, or grep, to inspect parts.\n"
-        f"--- head ({SPILL_EXCERPT_BYTES} bytes) ---\n{head}\n"
-        f"--- tail ({SPILL_EXCERPT_BYTES} bytes) ---\n{tail}"
+        f"--- head ({FILE_EXCERPT_BYTES} bytes) ---\n{head}\n"
+        f"--- tail ({FILE_EXCERPT_BYTES} bytes) ---\n{tail}"
     )
 
 
-def _spill_output(tool: ToolSpec, data: bytes, spill_dir: Path) -> str:
-    try:
-        path = _write_output_file(tool, data, spill_dir)
-    except OSError as exc:
-        print(f"cliwrap: spill failed ({exc}); falling back to truncate", file=sys.stderr)
-        return _truncate(data, tool.max_output_bytes)
-    return _file_reply(data, path, reason=f" (> {tool.max_output_bytes})")
+def _stderr_tail(stderr: bytes) -> str:
+    return stderr[-STDERR_TAIL_BYTES:].decode("utf-8", errors="replace")
 
 
 def _exec_env(tool: ToolSpec) -> dict[str, str] | None:
@@ -506,9 +589,15 @@ def _exec_env(tool: ToolSpec) -> dict[str, str] | None:
 def run_sync(
     tool: ToolSpec,
     argv: list[str],
-    spill_dir: Path | None = None,
-    output_dir: Path | None = None,
+    file_dir: Path | None = None,
+    call_dir: Path | None = None,
 ) -> str:
+    started_at = datetime.now(timezone.utc).isoformat()
+    # per-call 指定 (call_dir = 予約 param file_output_dir) または file mode では、
+    # 成否・サイズに関係なく常に全量をファイル化する (証跡: 失敗した実行も記録に残す)
+    dest = call_dir if call_dir is not None else (
+        file_dir if tool.output_mode == "file" else None
+    )
     try:
         proc = subprocess.run(
             argv,
@@ -517,30 +606,57 @@ def run_sync(
             timeout=tool.timeout_sec,
             env=_exec_env(tool),
         )
-    except subprocess.TimeoutExpired:
-        return f"error: command timed out after {tool.timeout_sec}s: {argv!r}"
+    except subprocess.TimeoutExpired as exc:
+        msg = f"error: command timed out after {tool.timeout_sec}s: {argv!r}"
+        if dest is not None:
+            # timeout でも捕捉済みの部分出力を best-effort で証跡に残す
+            meta = _invocation_meta(tool, argv, started_at, None, timed_out=True)
+            try:
+                inv_dir = _write_invocation_dir(
+                    tool, dest, exc.stdout or b"", exc.stderr or b"", meta,
+                )
+                msg += f"\npartial output saved to: {inv_dir}"
+            except OSError as write_exc:
+                msg += f"\n(failed to save partial output: {write_exc})"
+        return msg
     except OSError as exc:
         return f"error: failed to execute {argv!r}: {exc}"
+    if dest is not None:
+        meta = _invocation_meta(tool, argv, started_at, proc.returncode)
+        try:
+            inv_dir = _write_invocation_dir(tool, dest, proc.stdout, proc.stderr, meta)
+        except OSError as exc:
+            return f"error: failed to write output to {dest}: {exc}"
+        if proc.returncode != 0:
+            return (
+                f"error: command exited with code {proc.returncode}\n"
+                f"output saved to: {inv_dir}\n"
+                f"stderr (tail):\n{_stderr_tail(proc.stderr)}"
+            )
+        return _file_reply(proc.stdout, inv_dir)
     if proc.returncode != 0:
-        stderr_tail = proc.stderr[-STDERR_TAIL_BYTES:].decode("utf-8", errors="replace")
         return (
             f"error: command exited with code {proc.returncode}\n"
-            f"stderr (tail):\n{stderr_tail}"
+            f"stderr (tail):\n{_stderr_tail(proc.stderr)}"
         )
-    if output_dir is not None:
-        # 呼び出し側が明示した保存先へ、サイズに関係なく必ず全量を書く
-        try:
-            path = _write_output_file(tool, proc.stdout, output_dir)
-        except OSError as exc:
-            return f"error: failed to write output to {output_dir}: {exc}"
-        return _file_reply(proc.stdout, path)
     if (
-        len(proc.stdout) > tool.max_output_bytes
-        and tool.on_large_output == "spill"
-        and spill_dir is not None
+        len(proc.stdout) > tool.inline_max_output_bytes
+        and tool.inline_on_large_output == "file"
+        and file_dir is not None
     ):
-        return _spill_output(tool, proc.stdout, spill_dir)
-    return _truncate(proc.stdout, tool.max_output_bytes)
+        meta = _invocation_meta(tool, argv, started_at, proc.returncode)
+        try:
+            inv_dir = _write_invocation_dir(tool, file_dir, proc.stdout, proc.stderr, meta)
+        except OSError as exc:
+            print(
+                f"cliwrap: file output failed ({exc}); falling back to truncate",
+                file=sys.stderr,
+            )
+            return _truncate(proc.stdout, tool.inline_max_output_bytes)
+        return _file_reply(
+            proc.stdout, inv_dir, reason=f" (> {tool.inline_max_output_bytes})",
+        )
+    return _truncate(proc.stdout, tool.inline_max_output_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -572,12 +688,13 @@ class JobManager:
     """job モードの状態管理 (MVP)。
 
     サーバープロセス内の Popen 管理を主とし、出力・pid・メタ情報は
-    <cache_dir>/<server>/jobs/<job_id>/ のファイルに残す。サーバー再起動後の
-    孤児 job は best-effort (pid 生存確認と exit_code ファイル) でのみ参照できる。
+    <jobs_dir>/<job_id>/ のファイルに残す (jobs_dir は tool の出力ルート配下の
+    jobs/。既定は cache)。サーバー再起動後の孤児 job は best-effort
+    (pid 生存確認と exit_code ファイル) でのみ参照できる。
     """
 
-    def __init__(self, server_name: str, cache_dir: Path | None = None):
-        self.jobs_dir = (cache_dir or default_cache_dir()) / server_name / "jobs"
+    def __init__(self, jobs_dir: Path):
+        self.jobs_dir = jobs_dir
         self._procs: dict[str, subprocess.Popen] = {}
 
     def _job_dir(self, job_id: str) -> Path:
@@ -700,7 +817,7 @@ def _make_tool_fn(fn_name: str, tool: ToolSpec, invoke, inject_output_dir: bool 
 
     FastMCP は関数シグネチャから inputSchema を作るため、exec で実シグネチャを持つ
     関数を組み立てる。パラメータ名は config ロード時に識別子として検証済み。
-    inject_output_dir=True で予約パラメータ output_dir (optional) を注入する。
+    inject_output_dir=True で予約パラメータ file_output_dir (optional) を注入する。
     """
     required_args: list[str] = []
     optional_args: list[str] = []
@@ -714,7 +831,7 @@ def _make_tool_fn(fn_name: str, tool: ToolSpec, invoke, inject_output_dir: bool 
         else:
             optional_args.append(f"{pname}: {ann} = {spec.default!r}")
     if inject_output_dir:
-        optional_args.append("output_dir: str | None = None")
+        optional_args.append("file_output_dir: str | None = None")
     signature = ", ".join(required_args + optional_args)
     src = (
         f"def {fn_name}({signature}) -> str:\n"
@@ -731,12 +848,15 @@ def build_server(spec: ServerSpec, cache_dir: Path | None = None):
 
     mcp = FastMCP(spec.name, instructions=spec.description)
     server_cache_dir = (cache_dir or default_cache_dir()) / spec.name
-    spill_dir = server_cache_dir / "outputs"
-    jobs: JobManager | None = None
-    if any(tool.mode == "job" for tool in spec.tools.values()):
-        jobs = JobManager(spec.name, cache_dir=cache_dir)
+    # 出力ルートは tool の file_output_dir (未指定は cache)。sync は <root>/outputs/、
+    # job は <root>/jobs/ と、証跡が同じルート配下に集約される
+    jobs_by_root: dict[Path, JobManager] = {}
     for tool in spec.tools.values():
-        register_tool(mcp, spec, tool, jobs, spill_dir)
+        root = Path(tool.file_output_dir) if tool.file_output_dir else server_cache_dir
+        jobs: JobManager | None = None
+        if tool.mode == "job":
+            jobs = jobs_by_root.setdefault(root, JobManager(root / "jobs"))
+        register_tool(mcp, spec, tool, jobs, root / "outputs")
     return mcp
 
 
@@ -745,29 +865,29 @@ def register_tool(
     server_spec: ServerSpec,
     tool: ToolSpec,
     jobs: JobManager | None,
-    spill_dir: Path | None = None,
+    file_dir: Path | None = None,
 ) -> None:
     if tool.mode == "sync":
         def invoke(arguments: dict[str, Any], _tool=tool) -> str:
-            output_dir_arg = arguments.pop("output_dir", None)
-            output_dir: Path | None = None
-            if output_dir_arg is not None:
-                if not str(output_dir_arg).startswith("/"):
-                    return "error: output_dir must be an absolute path (starting with '/')"
-                output_dir = Path(output_dir_arg)
+            call_dir_arg = arguments.pop("file_output_dir", None)
+            call_dir: Path | None = None
+            if call_dir_arg is not None:
+                if not str(call_dir_arg).startswith("/"):
+                    return "error: file_output_dir must be an absolute path (starting with '/')"
+                call_dir = Path(call_dir_arg)
             try:
                 argv = render_argv(_tool, arguments)
             except ParamValidationError as exc:
                 return f"error: {exc}"
             print(f"cliwrap: exec {argv!r}", file=sys.stderr)
-            return run_sync(_tool, argv, spill_dir=spill_dir, output_dir=output_dir)
+            return run_sync(_tool, argv, file_dir=file_dir, call_dir=call_dir)
 
         fn = _make_tool_fn(f"tool_{tool.name}", tool, invoke, inject_output_dir=True)
         description = (
             _tool_description(tool)
-            + "\n- output_dir (string, optional) — absolute directory path; if set, "
-            "the full stdout is always written to a file there (regardless of size) "
-            "and only the file path + excerpts are returned"
+            + "\n- file_output_dir (string, optional) — absolute directory path; if set, "
+            "the full output is always written under it (regardless of size or exit "
+            "code) and only the file path + excerpts are returned"
         )
         mcp.add_tool(fn, name=tool.name, description=description)
     elif tool.mode == "job":
@@ -803,7 +923,7 @@ def register_job_tool(mcp, tool: ToolSpec, jobs: JobManager) -> None:
 
     def result_fn(job_id: str) -> str:
         try:
-            return jobs.result(job_id, tool.max_output_bytes)
+            return jobs.result(job_id, tool.inline_max_output_bytes)
         except ParamValidationError as exc:
             return f"error: {exc}"
 

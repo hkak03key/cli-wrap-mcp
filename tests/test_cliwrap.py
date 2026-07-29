@@ -491,7 +491,7 @@ class RunSyncTest(unittest.TestCase):
 
     def test_output_truncated_with_note(self):
         tool = self.tool(
-            [sys.executable, "-c", "print('x' * 1000)"], max_output_bytes=100,
+            [sys.executable, "-c", "print('x' * 1000)"], inline_max_output_bytes=100,
         )
         out = cliwrap.run_sync(tool, tool.argv)
         self.assertIn("output truncated at 100 bytes", out)
@@ -518,75 +518,169 @@ class RunSyncTest(unittest.TestCase):
         self.assertIn("failed to execute", out)
 
 
-class SpillTest(unittest.TestCase):
+class FileOutputModeTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.spill_dir = Path(self._tmp.name) / "outputs"
+        self.file_dir = Path(self._tmp.name) / "outputs"
 
     def tearDown(self):
         self._tmp.cleanup()
 
-    def tool(self, on_large_output="spill", max_output_bytes=100) -> cliwrap.ToolSpec:
+    def tool(self, output_mode="file", inline_max_output_bytes=100, argv=None,
+             inline_on_large_output="truncate") -> cliwrap.ToolSpec:
         return cliwrap.ToolSpec(
             name="t", description="",
-            argv=[sys.executable, "-c", "print('x' * 1000)"],
-            max_output_bytes=max_output_bytes,
-            on_large_output=on_large_output,
+            argv=argv or [sys.executable, "-c", "print('x' * 1000)"],
+            inline_max_output_bytes=inline_max_output_bytes,
+            output_mode=output_mode,
+            inline_on_large_output=inline_on_large_output,
         )
 
-    def test_spill_fires_and_file_holds_full_output(self):
+    def test_file_mode_writes_file_holding_full_output(self):
         tool = self.tool()
-        out = cliwrap.run_sync(tool, tool.argv, spill_dir=self.spill_dir)
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("full output saved to file", out)
         self.assertIn("1001 bytes", out)  # 総バイト数 (1000 + 改行)
         self.assertIn("offset/limit", out)
-        files = list(self.spill_dir.iterdir())
-        self.assertEqual(1, len(files))
-        self.assertTrue(files[0].name.startswith("t-"))
-        self.assertIn(str(files[0]), out)  # 絶対パスが返り値に含まれる
-        self.assertEqual(b"x" * 1000 + b"\n", files[0].read_bytes())  # 全量・無切り詰め
+        dirs = list(self.file_dir.iterdir())
+        self.assertEqual(1, len(dirs))
+        inv = dirs[0]
+        self.assertTrue(inv.is_dir())
+        self.assertTrue(inv.name.startswith("t-"))
+        self.assertIn(str(inv / "stdout.log"), out)  # 絶対パスが返り値に含まれる
+        self.assertEqual(b"x" * 1000 + b"\n", (inv / "stdout.log").read_bytes())  # 全量
+        self.assertEqual(b"", (inv / "stderr.log").read_bytes())
+        import json
 
-    def test_spill_not_fired_when_under_limit(self):
-        tool = self.tool(max_output_bytes=5000)
-        out = cliwrap.run_sync(tool, tool.argv, spill_dir=self.spill_dir)
-        self.assertEqual("x" * 1000 + "\n", out)  # 従来どおり本文をそのまま返す
-        self.assertFalse(self.spill_dir.exists())
+        meta = json.loads((inv / "meta.json").read_text())
+        self.assertEqual("t", meta["tool"])
+        self.assertEqual(tool.argv, meta["argv"])
+        self.assertEqual(0, meta["exit_code"])
+        self.assertIn("started_at", meta)
 
-    def test_truncate_mode_never_writes_file(self):
-        tool = self.tool(on_large_output="truncate")
-        out = cliwrap.run_sync(tool, tool.argv, spill_dir=self.spill_dir)
+    def test_file_mode_writes_even_small_output(self):
+        # file mode は証跡目的なので、上限以下でも常にファイル化する
+        tool = self.tool(inline_max_output_bytes=5000)
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        self.assertIn("full output saved to file", out)
+        self.assertEqual(1, len(list(self.file_dir.iterdir())))
+
+    def test_file_mode_writes_on_failure_too(self):
+        tool = self.tool(
+            argv=[sys.executable, "-c",
+                  "import sys; print('partial'); sys.stderr.write('boom'); sys.exit(3)"],
+        )
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        self.assertIn("exited with code 3", out)
+        self.assertIn("output saved to:", out)
+        self.assertIn("boom", out)
+        dirs = list(self.file_dir.iterdir())
+        self.assertEqual(1, len(dirs))  # 失敗した実行も証跡が残る
+        self.assertEqual(b"partial\n", (dirs[0] / "stdout.log").read_bytes())
+        self.assertEqual(b"boom", (dirs[0] / "stderr.log").read_bytes())
+        import json
+
+        self.assertEqual(3, json.loads((dirs[0] / "meta.json").read_text())["exit_code"])
+
+    def test_file_mode_timeout_saves_partial_output(self):
+        tool = cliwrap.ToolSpec(
+            name="t", description="", output_mode="file", timeout_sec=1,
+            argv=[sys.executable, "-u", "-c",
+                  "import time; print('before-sleep'); time.sleep(5)"],
+        )
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        self.assertIn("timed out after 1s", out)
+        self.assertIn("partial output saved to:", out)
+        dirs = list(self.file_dir.iterdir())
+        self.assertEqual(1, len(dirs))
+        self.assertEqual(b"before-sleep\n", (dirs[0] / "stdout.log").read_bytes())
+        import json
+
+        meta = json.loads((dirs[0] / "meta.json").read_text())
+        self.assertIsNone(meta["exit_code"])
+        self.assertTrue(meta["timed_out"])
+
+    def test_inline_truncate_never_writes_file(self):
+        tool = self.tool(output_mode="inline")
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("output truncated at 100 bytes", out)
-        self.assertFalse(self.spill_dir.exists())
+        self.assertFalse(self.file_dir.exists())
 
-    def test_spill_without_dir_falls_back_to_truncate(self):
+    def test_inline_on_large_output_file_writes_only_on_overflow(self):
+        tool = self.tool(output_mode="inline", inline_on_large_output="file")
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        self.assertIn("full output saved to file", out)  # 超過 → ファイル化 (旧 spill)
+        self.assertEqual(1, len(list(self.file_dir.iterdir())))
+
+    def test_inline_on_large_output_file_stays_inline_under_limit(self):
+        tool = self.tool(
+            output_mode="inline", inline_on_large_output="file",
+            inline_max_output_bytes=5000,
+        )
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        self.assertEqual("x" * 1000 + "\n", out)
+        self.assertFalse(self.file_dir.exists())
+
+    def test_file_mode_without_dir_falls_back_to_truncate(self):
         tool = self.tool()
-        out = cliwrap.run_sync(tool, tool.argv, spill_dir=None)
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=None)
         self.assertIn("output truncated at 100 bytes", out)
 
 
-class SpillConfigTest(unittest.TestCase):
-    def test_invalid_on_large_output_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "on_large_output"):
+class OutputModeConfigTest(unittest.TestCase):
+    def test_invalid_output_mode_is_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "output_mode"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
-                '  - {name: x, argv: ["true"], on_large_output: keep}\n'
+                '  - {name: x, argv: ["true"], output_mode: spill}\n'
             )
 
     def test_defaults_inherited_and_overridable(self):
         spec = load_yaml(
             'server: {name: t}\n'
-            'defaults: {on_large_output: spill}\n'
+            'defaults: {output_mode: file}\n'
             'tools:\n'
             '  - {name: a, argv: ["true"]}\n'
-            '  - {name: b, argv: ["true"], on_large_output: truncate}\n'
+            '  - {name: b, argv: ["true"], output_mode: inline}\n'
         )
-        self.assertEqual("spill", spec.tools["a"].on_large_output)
-        self.assertEqual("truncate", spec.tools["b"].on_large_output)
+        self.assertEqual("file", spec.tools["a"].output_mode)
+        self.assertEqual("inline", spec.tools["b"].output_mode)
 
-    def test_default_is_truncate(self):
+    def test_default_is_inline(self):
         spec = load_yaml(MINIMAL)
-        self.assertEqual("truncate", spec.tools["echo"].on_large_output)
+        self.assertEqual("inline", spec.tools["echo"].output_mode)
+        self.assertEqual("truncate", spec.tools["echo"].inline_on_large_output)
+
+    def test_invalid_inline_on_large_output_is_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "inline_on_large_output"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - {name: x, argv: ["true"], inline_on_large_output: spill}\n'
+            )
+
+    def test_inline_settings_inherited_from_defaults(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'defaults: {inline_on_large_output: file, inline_max_output_bytes: 123}\n'
+            'tools:\n'
+            '  - {name: a, argv: ["true"]}\n'
+            '  - {name: b, argv: ["true"], inline_on_large_output: truncate}\n'
+        )
+        self.assertEqual("file", spec.tools["a"].inline_on_large_output)
+        self.assertEqual(123, spec.tools["a"].inline_max_output_bytes)
+        self.assertEqual("truncate", spec.tools["b"].inline_on_large_output)
+
+    def test_inline_keys_allowed_on_file_mode_tool(self):
+        # file mode では inline_* は使われないが、defaults 運用のためエラーにしない
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'defaults: {inline_on_large_output: file}\n'
+            'tools:\n'
+            '  - {name: x, argv: ["true"], output_mode: file, inline_max_output_bytes: 10}\n'
+        )
+        self.assertEqual("file", spec.tools["x"].output_mode)
 
     def test_unknown_defaults_key_is_error(self):
         with self.assertRaisesRegex(cliwrap.ConfigError, "defaults"):
@@ -705,7 +799,7 @@ class EnvExecTest(unittest.TestCase):
 
     def test_job_start_forces_env_var(self):
         with tempfile.TemporaryDirectory() as tmp:
-            jobs = cliwrap.JobManager("testsrv", cache_dir=Path(tmp))
+            jobs = cliwrap.JobManager(Path(tmp) / "jobs")
             tool = cliwrap.ToolSpec(
                 name="j", description="", argv=[], mode="job",
                 env={"CLIWRAP_TEST_VAR": "forced"},
@@ -726,7 +820,7 @@ class EnvExecTest(unittest.TestCase):
 
 
 class OutputDirTest(unittest.TestCase):
-    """全 sync ツールに自動注入される output_dir param の挙動。"""
+    """全 sync ツールに自動注入される file_output_dir param の挙動。"""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -745,40 +839,40 @@ class OutputDirTest(unittest.TestCase):
     def server(self):
         return cliwrap.build_server(load_yaml(MINIMAL), cache_dir=Path(self._tmp.name))
 
-    def test_output_dir_forces_file_even_for_small_output(self):
-        out = self.call(self.server(), "echo", {"msg": "hi", "output_dir": self.dest})
+    def test_call_file_output_dir_forces_file_even_for_small_output(self):
+        out = self.call(self.server(), "echo", {"msg": "hi", "file_output_dir": self.dest})
         self.assertIn("full output saved to file", out)
-        files = list(Path(self.dest).iterdir())  # dir は mkdir -p 相当で自動作成
-        self.assertEqual(1, len(files))
-        self.assertTrue(files[0].name.startswith("echo-"))
-        self.assertIn(str(files[0]), out)
-        self.assertEqual(b"hi\n", files[0].read_bytes())  # 小出力でも全量ファイル化
+        dirs = list(Path(self.dest).iterdir())  # dir は mkdir -p 相当で自動作成
+        self.assertEqual(1, len(dirs))
+        self.assertTrue(dirs[0].name.startswith("echo-"))
+        self.assertIn(str(dirs[0] / "stdout.log"), out)
+        self.assertEqual(b"hi\n", (dirs[0] / "stdout.log").read_bytes())  # 小出力でも全量
 
-    def test_without_output_dir_behaves_as_before(self):
+    def test_without_call_file_output_dir_behaves_as_before(self):
         out = self.call(self.server(), "echo", {"msg": "hi"})
         self.assertEqual("hi\n", out)
         self.assertFalse(Path(self.dest).exists())
 
-    def test_relative_output_dir_rejected(self):
-        out = self.call(self.server(), "echo", {"msg": "hi", "output_dir": "rel/dir"})
-        self.assertIn("error: output_dir must be an absolute path", out)
+    def test_relative_call_file_output_dir_rejected(self):
+        out = self.call(self.server(), "echo", {"msg": "hi", "file_output_dir": "rel/dir"})
+        self.assertIn("error: file_output_dir must be an absolute path", out)
 
     def test_write_failure_returns_error_string(self):
         # 既存ファイルの下に dir は作れない → OSError → エラー文字列
         blocker = Path(self._tmp.name) / "blocker"
         blocker.write_text("file")
         out = self.call(
-            self.server(), "echo", {"msg": "hi", "output_dir": str(blocker / "sub")},
+            self.server(), "echo", {"msg": "hi", "file_output_dir": str(blocker / "sub")},
         )
         self.assertIn("error: failed to write output", out)
 
-    def test_output_dir_in_schema_as_optional(self):
+    def test_file_output_dir_in_schema_as_optional(self):
         import anyio
 
         tools = anyio.run(self.server().list_tools)
         schema = tools[0].inputSchema
-        self.assertIn("output_dir", schema["properties"])
-        self.assertNotIn("output_dir", schema.get("required", []))
+        self.assertIn("file_output_dir", schema["properties"])
+        self.assertNotIn("file_output_dir", schema.get("required", []))
 
     def test_job_tools_not_injected(self):
         import anyio
@@ -786,22 +880,22 @@ class OutputDirTest(unittest.TestCase):
         spec = load_yaml(JobConfigTest.JOB_YAML)
         server = cliwrap.build_server(spec, cache_dir=Path(self._tmp.name))
         for tool in anyio.run(server.list_tools):
-            self.assertNotIn("output_dir", tool.inputSchema["properties"], tool.name)
+            self.assertNotIn("file_output_dir", tool.inputSchema["properties"], tool.name)
 
-    def test_output_dir_wins_over_truncate_for_large_output(self):
+    def test_call_file_output_dir_wins_over_truncate_for_large_output(self):
         spec = load_yaml(
             'server: {name: t}\n'
             'tools:\n'
             '  - name: big\n'
             '    description: big\n'
-            '    max_output_bytes: 100\n'
+            '    inline_max_output_bytes: 100\n'
             f'    argv: ["{sys.executable}", "-c", "print(\'x\' * 1000)"]\n'
         )
         server = cliwrap.build_server(spec, cache_dir=Path(self._tmp.name))
-        out = self.call(server, "big", {"output_dir": self.dest})
+        out = self.call(server, "big", {"file_output_dir": self.dest})
         self.assertIn("1001 bytes", out)
-        files = list(Path(self.dest).iterdir())
-        self.assertEqual(b"x" * 1000 + b"\n", files[0].read_bytes())  # 切り詰めなし
+        dirs = list(Path(self.dest).iterdir())
+        self.assertEqual(b"x" * 1000 + b"\n", (dirs[0] / "stdout.log").read_bytes())  # 全量
 
     def test_reserved_param_name_is_config_error(self):
         with self.assertRaisesRegex(cliwrap.ConfigError, "reserved"):
@@ -809,17 +903,105 @@ class OutputDirTest(unittest.TestCase):
                 'server: {name: t}\n'
                 'tools:\n'
                 '  - name: x\n'
-                '    argv: ["echo", "{output_dir}"]\n'
-                '    params: {output_dir: {type: string}}\n'
+                '    argv: ["echo", "{file_output_dir}"]\n'
+                '    params: {file_output_dir: {type: string}}\n'
             )
+
+
+class FileOutputDirConfigTest(unittest.TestCase):
+    """config レベル file_output_dir (defaults / tool) と出力ルートの解決。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "audit"
+        self.cache = Path(self._tmp.name) / "cache"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def call(self, server, name, args) -> str:
+        import anyio
+
+        result = anyio.run(lambda: server.call_tool(name, args))
+        content = result[0] if isinstance(result, tuple) else result
+        return content[0].text
+
+    def test_relative_path_is_config_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "absolute path"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - {name: x, argv: ["true"], file_output_dir: rel/dir}\n'
+            )
+
+    def test_defaults_inherited_and_tool_wins(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'defaults: {file_output_dir: /srv/default}\n'
+            'tools:\n'
+            '  - {name: a, argv: ["true"]}\n'
+            '  - {name: b, argv: ["true"], file_output_dir: /srv/b}\n'
+        )
+        self.assertEqual("/srv/default", spec.tools["a"].file_output_dir)
+        self.assertEqual("/srv/b", spec.tools["b"].file_output_dir)
+
+    def test_file_mode_writes_under_configured_root(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: say\n'
+            '    output_mode: file\n'
+            f'    file_output_dir: {self.root}\n'
+            f'    argv: ["{sys.executable}", "-c", "print(\'hi\')"]\n'
+        )
+        server = cliwrap.build_server(spec, cache_dir=self.cache)
+        out = self.call(server, "say", {})
+        self.assertIn(str(self.root / "outputs"), out)
+        dirs = list((self.root / "outputs").iterdir())
+        self.assertEqual(1, len(dirs))
+        self.assertEqual(b"hi\n", (dirs[0] / "stdout.log").read_bytes())
+        self.assertFalse(self.cache.exists())  # cache 側には何も書かれない
+
+    def test_per_call_param_wins_over_configured_root(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: say\n'
+            '    output_mode: file\n'
+            f'    file_output_dir: {self.root}\n'
+            f'    argv: ["{sys.executable}", "-c", "print(\'hi\')"]\n'
+        )
+        server = cliwrap.build_server(spec, cache_dir=self.cache)
+        dest = str(Path(self._tmp.name) / "per-call")
+        out = self.call(server, "say", {"file_output_dir": dest})
+        self.assertIn(dest, out)
+        self.assertEqual(1, len(list(Path(dest).iterdir())))
+        self.assertFalse(self.root.exists())
+
+    def test_jobs_live_under_configured_root(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: task\n'
+            '    mode: job\n'
+            f'    file_output_dir: {self.root}\n'
+            f'    argv: ["{sys.executable}", "-c", "print(\'job-out\')"]\n'
+        )
+        server = cliwrap.build_server(spec, cache_dir=self.cache)
+        out = self.call(server, "task_start", {})
+        self.assertIn("job started:", out)
+        self.assertIn(str(self.root / "jobs"), out)
+        jobs = list((self.root / "jobs").iterdir())
+        self.assertEqual(1, len(jobs))
+        self.assertFalse(self.cache.exists())
 
 
 class JobModeTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.jobs = cliwrap.JobManager("testsrv", cache_dir=Path(self._tmp.name))
+        self.jobs = cliwrap.JobManager(Path(self._tmp.name) / "jobs")
         self.tool = cliwrap.ToolSpec(
-            name="j", description="", argv=[], mode="job", max_output_bytes=10_000,
+            name="j", description="", argv=[], mode="job", inline_max_output_bytes=10_000,
         )
 
     def tearDown(self):
@@ -851,7 +1033,7 @@ class JobModeTest(unittest.TestCase):
         status = self.jobs.status(job_id)
         self.assertIn("exited", status)
         self.assertIn("job-out", status)
-        result = self.jobs.result(job_id, self.tool.max_output_bytes)
+        result = self.jobs.result(job_id, self.tool.inline_max_output_bytes)
         self.assertIn("job-out", result)
         jdir = self.jobs.jobs_dir / job_id
         for name in ("stdout.log", "stderr.log", "pid", "meta.json", "exit_code"):
@@ -956,7 +1138,7 @@ class BuildServerTest(unittest.TestCase):
         tools = anyio.run(server.list_tools)
         self.assertEqual(["echo"], [t.name for t in tools])
         schema = tools[0].inputSchema
-        self.assertEqual(["msg", "output_dir"], list(schema["properties"]))
+        self.assertEqual(["msg", "file_output_dir"], list(schema["properties"]))
         self.assertEqual(["msg"], schema.get("required", []))
         self.assertEqual("string", schema["properties"]["msg"]["type"])
 

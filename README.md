@@ -52,10 +52,12 @@ Safety is the core of this engine, enforced at execution and load time:
   reference undefined parameters.
 - **stdout is protocol-only.** The MCP stdio channel is never polluted; all engine
   logging goes to stderr.
-- **Bounded output.** Tool output is truncated at `max_output_bytes` by default;
-  `on_large_output: spill` writes the full output to a cache file and returns only
-  the path plus head/tail excerpts. Callers can also pass the auto-injected
-  `output_dir` parameter to force the full stdout into a file of their choosing.
+- **Bounded output.** Inline tool output is truncated at `inline_max_output_bytes`
+  by default; `inline_on_large_output: file` diverts oversized output to a file
+  (path plus head/tail excerpts), and `output_mode: file` always writes the full
+  output to a file — success or failure — for audit-trail use. Callers can also
+  pass the auto-injected `file_output_dir` parameter to force the full output into
+  a directory of their choosing.
 - **Job isolation.** Background job IDs are strictly format-checked, blocking path
   traversal through `job_id`.
 - **Guardrails, not a sandbox.** For "arbitrary subcommand" tools (an `array` param
@@ -131,7 +133,10 @@ Top level:
 |:----|:---------|:------------|
 | `server.name` | yes | MCP server name. |
 | `server.description` | no | Served as the MCP `instructions`. |
-| `defaults.on_large_output` | no | Default large-output mode for all tools: `truncate` (default) or `spill`. |
+| `defaults.output_mode` | no | Default output mode for all tools: `inline` (default) or `file` (see per-tool `output_mode`). |
+| `defaults.inline_max_output_bytes` | no | Default inline size limit for all tools. |
+| `defaults.inline_on_large_output` | no | Default overflow behavior for all tools: `truncate` (default) or `file`. |
+| `defaults.file_output_dir` | no | Default output root for all tools (absolute path; see per-tool `file_output_dir`). |
 | `defaults.env` | no | Environment variables forced for every tool (mapping of `VAR_NAME` → string; quote numbers). Merged over the inherited environment at execution time, so config values always win. |
 | `tools` | yes | List of tool definitions (at least one). |
 
@@ -144,8 +149,10 @@ Per tool:
 | `argv` | yes | — | Non-empty list of strings. `{param}` placeholders are substituted after validation; each element stays a single argv entry. |
 | `mode` | no | `sync` | `sync` (run and return) or `job` (background, see below). |
 | `timeout_sec` | no | `60` | Sync-mode timeout. |
-| `max_output_bytes` | no | `50000` | Output size limit returned inline. |
-| `on_large_output` | no | inherits `defaults` | `truncate` or `spill`. |
+| `output_mode` | no | inherits `defaults` (`inline`) | `inline`: output is returned in the reply, subject to `inline_max_output_bytes`. `file`: output is **always** written to a file in full — success or failure, any size — and the reply carries the path plus head/tail excerpts (audit trail). |
+| `inline_max_output_bytes` | no | inherits `defaults` (`50000`) | Inline size limit (`output_mode: inline` only; also caps job `_result` tails). |
+| `inline_on_large_output` | no | inherits `defaults` (`truncate`) | What happens when inline output exceeds the limit: `truncate` (excess is lost) or `file` (full output goes to a file, reply carries path plus excerpts). |
+| `file_output_dir` | no | inherits `defaults` (cache dir) | Output root for this tool (absolute path). File outputs go to `<root>/outputs/`, job state to `<root>/jobs/`, so all traces of a tool accumulate under one configured location. |
 | `params` | no | `{}` | Mapping of parameter name → spec. |
 | `env` | no | `{}` | Environment variables forced for this tool. Merged over `defaults.env` (tool wins), then over the inherited environment at execution time. |
 
@@ -180,12 +187,30 @@ use it to pass a variable-length subcommand tail (`gcloud {args}`). Rules:
   argparse-style CLIs the last occurrence of a flag wins).
 
 Parameter names must match `[a-z_][a-z0-9_]*` and must not be Python keywords.
-`output_dir` is **reserved**: the engine injects it into every sync tool as an
-optional absolute-path parameter; when set, the full stdout is always written to a
-file there and only the file path plus excerpts are returned.
+`file_output_dir` is **reserved**: the engine injects it into every sync tool as an
+optional absolute-path parameter; when set, the full output is always written under
+that directory — regardless of size, exit code, or the tool's `output_mode` — and
+only the file path plus excerpts are returned. It overrides the config-level
+`file_output_dir` for that call.
 
-Spill files and job state live under `~/.cache/cli-mcp/<server>/` (override with
-`CLI_MCP_CACHE_DIR`).
+### File output layout
+
+Every file output is a per-invocation directory (same layout as job dirs):
+
+```
+<root>/outputs/<tool>-<timestamp>-<id>/
+  stdout.log   # full stdout
+  stderr.log   # full stderr
+  meta.json    # tool, argv, started_at, exit_code (timed_out on timeout)
+<root>/jobs/<job_id>/
+  stdout.log  stderr.log  meta.json  pid  exit_code
+```
+
+`meta.json` records what was executed, so a `file`-mode tool leaves a self-contained
+audit trail: what ran, when, what it printed (including failures and timeouts,
+best-effort). `<root>` resolution: per-call `file_output_dir` param > tool
+`file_output_dir` > `defaults.file_output_dir` > `~/.cache/cli-mcp/<server>/`
+(override the cache location with `CLI_MCP_CACHE_DIR`).
 
 ## Job mode
 
@@ -193,12 +218,12 @@ Spill files and job state live under `~/.cache/cli-mcp/<server>/` (override with
 
 - `<name>_start` — starts the command detached (own process group), returns a `job_id`
 - `<name>_status` — running/exited state plus stdout/stderr tails
-- `<name>_result` — final output (tail-limited by `max_output_bytes`)
+- `<name>_result` — final output (tail-limited by `inline_max_output_bytes`)
 - `<name>_cancel` — SIGTERM to the whole process group
 
-Job logs and metadata persist under the cache dir, so finished jobs remain
-inspectable (best-effort) even across server restarts. See
-[`examples/sleep-job.yml`](examples/sleep-job.yml).
+Job logs and metadata persist under `<root>/jobs/` (the tool's `file_output_dir`,
+or the cache dir), so finished jobs remain inspectable (best-effort) even across
+server restarts. See [`examples/sleep-job.yml`](examples/sleep-job.yml).
 
 ## Development
 
