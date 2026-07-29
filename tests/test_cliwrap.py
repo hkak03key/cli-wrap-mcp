@@ -7,15 +7,27 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cli_wrap_mcp import cliwrap
+from cli_wrap_mcp.config import load_config
+from cli_wrap_mcp.execution import run_sync
+from cli_wrap_mcp.jobs import JobManager
+from cli_wrap_mcp.rendering import render_argv, validate_param
+from cli_wrap_mcp.server import build_server
+from cli_wrap_mcp.spec import (
+    DEFAULT_TIMEOUT_SEC,
+    ConfigError,
+    ParamSpec,
+    ParamValidationError,
+    ServerSpec,
+    ToolSpec,
+)
 
 
-def load_yaml(text: str) -> cliwrap.ServerSpec:
+def load_yaml(text: str) -> ServerSpec:
     with tempfile.NamedTemporaryFile("w", suffix=".yml", delete=False) as fp:
         fp.write(text)
         path = fp.name
     try:
-        return cliwrap.load_config(path)
+        return load_config(path)
     finally:
         Path(path).unlink()
 
@@ -41,19 +53,19 @@ class LoadConfigTest(unittest.TestCase):
         self.assertEqual(["echo"], list(spec.tools))
         tool = spec.tools["echo"]
         self.assertEqual("sync", tool.mode)
-        self.assertEqual(cliwrap.DEFAULT_TIMEOUT_SEC, tool.timeout_sec)
+        self.assertEqual(DEFAULT_TIMEOUT_SEC, tool.timeout_sec)
         self.assertTrue(tool.params["msg"].required)
 
     def test_missing_server_section_is_error(self):
-        with self.assertRaises(cliwrap.ConfigError):
+        with self.assertRaises(ConfigError):
             load_yaml('tools:\n  - {name: x, argv: ["true"]}\n')
 
     def test_no_tools_is_error(self):
-        with self.assertRaises(cliwrap.ConfigError):
+        with self.assertRaises(ConfigError):
             load_yaml('server: {name: t}\n')
 
     def test_undefined_placeholder_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "undefined placeholders"):
+        with self.assertRaisesRegex(ConfigError, "undefined placeholders"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -61,7 +73,7 @@ class LoadConfigTest(unittest.TestCase):
             )
 
     def test_format_spec_in_placeholder_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "format spec"):
+        with self.assertRaisesRegex(ConfigError, "format spec"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -71,7 +83,7 @@ class LoadConfigTest(unittest.TestCase):
             )
 
     def test_positional_placeholder_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "positional"):
+        with self.assertRaisesRegex(ConfigError, "positional"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -79,7 +91,7 @@ class LoadConfigTest(unittest.TestCase):
             )
 
     def test_attribute_access_placeholder_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "attribute/index"):
+        with self.assertRaisesRegex(ConfigError, "attribute/index"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -89,7 +101,7 @@ class LoadConfigTest(unittest.TestCase):
             )
 
     def test_invalid_param_name_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "invalid param name"):
+        with self.assertRaisesRegex(ConfigError, "invalid param name"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -99,7 +111,7 @@ class LoadConfigTest(unittest.TestCase):
             )
 
     def test_unknown_param_type_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "unknown type"):
+        with self.assertRaisesRegex(ConfigError, "unknown type"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -109,7 +121,7 @@ class LoadConfigTest(unittest.TestCase):
             )
 
     def test_unknown_tool_key_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "unknown keys"):
+        with self.assertRaisesRegex(ConfigError, "unknown keys"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -117,7 +129,7 @@ class LoadConfigTest(unittest.TestCase):
             )
 
     def test_optional_param_without_default_referenced_in_argv_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "optional but has no default"):
+        with self.assertRaisesRegex(ConfigError, "optional but has no default"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -127,7 +139,7 @@ class LoadConfigTest(unittest.TestCase):
             )
 
     def test_duplicate_tool_name_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "duplicate tool name"):
+        with self.assertRaisesRegex(ConfigError, "duplicate tool name"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -136,7 +148,7 @@ class LoadConfigTest(unittest.TestCase):
             )
 
     def test_unknown_mode_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "unknown mode"):
+        with self.assertRaisesRegex(ConfigError, "unknown mode"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -144,7 +156,7 @@ class LoadConfigTest(unittest.TestCase):
             )
 
     def test_default_type_mismatch_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "does not match type"):
+        with self.assertRaisesRegex(ConfigError, "does not match type"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -154,7 +166,7 @@ class LoadConfigTest(unittest.TestCase):
             )
 
     def test_invalid_regex_pattern_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "invalid pattern"):
+        with self.assertRaisesRegex(ConfigError, "invalid pattern"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -182,7 +194,7 @@ class ArrayConfigTest(unittest.TestCase):
         self.assertEqual("--project(=.*)?", p.deny_pattern)
 
     def test_embedded_array_placeholder_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "entire argv element"):
+        with self.assertRaisesRegex(ConfigError, "entire argv element"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -192,7 +204,7 @@ class ArrayConfigTest(unittest.TestCase):
             )
 
     def test_array_placeholder_mixed_with_literal_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "entire argv element"):
+        with self.assertRaisesRegex(ConfigError, "entire argv element"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -214,7 +226,7 @@ class ArrayConfigTest(unittest.TestCase):
         self.assertEqual([], spec.tools["run"].params["args"].default)
 
     def test_array_default_must_be_string_list(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "list of strings"):
+        with self.assertRaisesRegex(ConfigError, "list of strings"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -224,7 +236,7 @@ class ArrayConfigTest(unittest.TestCase):
             )
 
     def test_array_enum_items_must_be_strings(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "must be strings"):
+        with self.assertRaisesRegex(ConfigError, "must be strings"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -234,7 +246,7 @@ class ArrayConfigTest(unittest.TestCase):
             )
 
     def test_invalid_deny_pattern_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "invalid deny_pattern"):
+        with self.assertRaisesRegex(ConfigError, "invalid deny_pattern"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -244,7 +256,7 @@ class ArrayConfigTest(unittest.TestCase):
             )
 
     def test_deny_pattern_on_integer_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "only supported for string/array"):
+        with self.assertRaisesRegex(ConfigError, "only supported for string/array"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -255,61 +267,61 @@ class ArrayConfigTest(unittest.TestCase):
 
 
 class ValidateParamTest(unittest.TestCase):
-    def spec(self, **kwargs) -> cliwrap.ParamSpec:
-        return cliwrap.ParamSpec(name="p", **kwargs)
+    def spec(self, **kwargs) -> ParamSpec:
+        return ParamSpec(name="p", **kwargs)
 
     def test_type_mismatch_rejected(self):
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "expected string"):
-            cliwrap.validate_param(self.spec(type="string"), 42)
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "expected integer"):
-            cliwrap.validate_param(self.spec(type="integer"), "42")
+        with self.assertRaisesRegex(ParamValidationError, "expected string"):
+            validate_param(self.spec(type="string"), 42)
+        with self.assertRaisesRegex(ParamValidationError, "expected integer"):
+            validate_param(self.spec(type="integer"), "42")
 
     def test_bool_is_not_integer(self):
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "expected integer"):
-            cliwrap.validate_param(self.spec(type="integer"), True)
+        with self.assertRaisesRegex(ParamValidationError, "expected integer"):
+            validate_param(self.spec(type="integer"), True)
 
     def test_pattern_must_fullmatch(self):
         spec = self.spec(type="string", pattern=r"[a-z]+/[a-z]+")
-        self.assertEqual("own/repo", cliwrap.validate_param(spec, "own/repo"))
+        self.assertEqual("own/repo", validate_param(spec, "own/repo"))
         # 部分一致は拒否 (fullmatch)
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "does not match pattern"):
-            cliwrap.validate_param(spec, "own/repo; rm -rf /")
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "does not match pattern"):
-            cliwrap.validate_param(spec, "prefix own/repo")
+        with self.assertRaisesRegex(ParamValidationError, "does not match pattern"):
+            validate_param(spec, "own/repo; rm -rf /")
+        with self.assertRaisesRegex(ParamValidationError, "does not match pattern"):
+            validate_param(spec, "prefix own/repo")
 
     def test_enum_rejects_unlisted_value(self):
         spec = self.spec(type="string", enum=["open", "closed"])
-        self.assertEqual("open", cliwrap.validate_param(spec, "open"))
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "not in enum"):
-            cliwrap.validate_param(spec, "merged")
+        self.assertEqual("open", validate_param(spec, "open"))
+        with self.assertRaisesRegex(ParamValidationError, "not in enum"):
+            validate_param(spec, "merged")
 
     def test_boolean_renders_lowercase(self):
         spec = self.spec(type="boolean")
-        self.assertEqual("true", cliwrap.validate_param(spec, True))
-        self.assertEqual("false", cliwrap.validate_param(spec, False))
+        self.assertEqual("true", validate_param(spec, True))
+        self.assertEqual("false", validate_param(spec, False))
 
     # --- 引数インジェクション対策 ---------------------------------------
 
     def test_dash_prefix_rejected_by_default(self):
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "starting with '-'"):
-            cliwrap.validate_param(self.spec(type="string"), "--help")
+        with self.assertRaisesRegex(ParamValidationError, "starting with '-'"):
+            validate_param(self.spec(type="string"), "--help")
 
     def test_negative_integer_rejected_by_default(self):
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "starting with '-'"):
-            cliwrap.validate_param(self.spec(type="integer"), -1)
+        with self.assertRaisesRegex(ParamValidationError, "starting with '-'"):
+            validate_param(self.spec(type="integer"), -1)
 
     def test_dash_prefix_allowed_when_opted_in(self):
         spec = self.spec(type="string", allow_dash_prefix=True)
-        self.assertEqual("--help", cliwrap.validate_param(spec, "--help"))
+        self.assertEqual("--help", validate_param(spec, "--help"))
 
     # --- deny_pattern (blocklist) ---------------------------------------
 
     def test_deny_pattern_rejects_fullmatch_only(self):
         spec = self.spec(type="string", deny_pattern=r"forbidden")
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "denied by deny_pattern"):
-            cliwrap.validate_param(spec, "forbidden")
+        with self.assertRaisesRegex(ParamValidationError, "denied by deny_pattern"):
+            validate_param(spec, "forbidden")
         # 部分一致は拒否しない (fullmatch)
-        self.assertEqual("forbidden-ish", cliwrap.validate_param(spec, "forbidden-ish"))
+        self.assertEqual("forbidden-ish", validate_param(spec, "forbidden-ish"))
 
     # --- array param -----------------------------------------------------
 
@@ -317,29 +329,29 @@ class ValidateParamTest(unittest.TestCase):
         spec = self.spec(type="array")
         self.assertEqual(
             ["compute", "instances", "list"],
-            cliwrap.validate_param(spec, ["compute", "instances", "list"]),
+            validate_param(spec, ["compute", "instances", "list"]),
         )
-        self.assertEqual([], cliwrap.validate_param(spec, []))
+        self.assertEqual([], validate_param(spec, []))
 
     def test_array_rejects_non_list(self):
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "expected array"):
-            cliwrap.validate_param(self.spec(type="array"), "compute instances list")
+        with self.assertRaisesRegex(ParamValidationError, "expected array"):
+            validate_param(self.spec(type="array"), "compute instances list")
 
     def test_array_rejects_non_string_item(self):
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, r"'p'\[1\].*expected string"):
-            cliwrap.validate_param(self.spec(type="array"), ["ok", 42])
+        with self.assertRaisesRegex(ParamValidationError, r"'p'\[1\].*expected string"):
+            validate_param(self.spec(type="array"), ["ok", 42])
 
     def test_array_item_pattern_fullmatch(self):
         spec = self.spec(type="array", pattern=r"[a-z-]+")
-        self.assertEqual(["a", "b-c"], cliwrap.validate_param(spec, ["a", "b-c"]))
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "does not match pattern"):
-            cliwrap.validate_param(spec, ["ok", "not ok"])
+        self.assertEqual(["a", "b-c"], validate_param(spec, ["a", "b-c"]))
+        with self.assertRaisesRegex(ParamValidationError, "does not match pattern"):
+            validate_param(spec, ["ok", "not ok"])
 
     def test_array_item_dash_guard_and_opt_in(self):
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "starting with '-'"):
-            cliwrap.validate_param(self.spec(type="array"), ["--force"])
+        with self.assertRaisesRegex(ParamValidationError, "starting with '-'"):
+            validate_param(self.spec(type="array"), ["--force"])
         spec = self.spec(type="array", allow_dash_prefix=True)
-        self.assertEqual(["--force"], cliwrap.validate_param(spec, ["--force"]))
+        self.assertEqual(["--force"], validate_param(spec, ["--force"]))
 
     def test_array_item_deny_pattern(self):
         spec = self.spec(
@@ -349,22 +361,22 @@ class ValidateParamTest(unittest.TestCase):
         )
         self.assertEqual(
             ["compute", "--zone=asia-northeast1-a"],
-            cliwrap.validate_param(spec, ["compute", "--zone=asia-northeast1-a"]),
+            validate_param(spec, ["compute", "--zone=asia-northeast1-a"]),
         )
         for bad in ("--project", "--project=other", "--flags-file=/tmp/x.yml"):
-            with self.assertRaisesRegex(cliwrap.ParamValidationError, "denied by deny_pattern"):
-                cliwrap.validate_param(spec, [bad])
+            with self.assertRaisesRegex(ParamValidationError, "denied by deny_pattern"):
+                validate_param(spec, [bad])
 
     def test_array_item_enum(self):
         spec = self.spec(type="array", enum=["a", "b"])
-        self.assertEqual(["a", "b"], cliwrap.validate_param(spec, ["a", "b"]))
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "not in enum"):
-            cliwrap.validate_param(spec, ["c"])
+        self.assertEqual(["a", "b"], validate_param(spec, ["a", "b"]))
+        with self.assertRaisesRegex(ParamValidationError, "not in enum"):
+            validate_param(spec, ["c"])
 
 
 class RenderArgvTest(unittest.TestCase):
-    def tool(self, argv, **params) -> cliwrap.ToolSpec:
-        return cliwrap.ToolSpec(
+    def tool(self, argv, **params) -> ToolSpec:
+        return ToolSpec(
             name="t", description="", argv=argv,
             params={name: spec for name, spec in params.items()},
         )
@@ -372,128 +384,128 @@ class RenderArgvTest(unittest.TestCase):
     def test_basic_substitution(self):
         tool = self.tool(
             ["gh", "api", "repos/{repo}"],
-            repo=cliwrap.ParamSpec(name="repo", type="string"),
+            repo=ParamSpec(name="repo", type="string"),
         )
         self.assertEqual(
             ["gh", "api", "repos/own/repo"],
-            cliwrap.render_argv(tool, {"repo": "own/repo"}),
+            render_argv(tool, {"repo": "own/repo"}),
         )
 
     def test_default_applied_when_omitted(self):
         tool = self.tool(
             ["gh", "pr", "list", "--limit", "{limit}"],
-            limit=cliwrap.ParamSpec(name="limit", type="integer", default=10),
+            limit=ParamSpec(name="limit", type="integer", default=10),
         )
         self.assertEqual(
             ["gh", "pr", "list", "--limit", "10"],
-            cliwrap.render_argv(tool, {}),
+            render_argv(tool, {}),
         )
         self.assertEqual(
             ["gh", "pr", "list", "--limit", "5"],
-            cliwrap.render_argv(tool, {"limit": 5}),
+            render_argv(tool, {"limit": 5}),
         )
 
     def test_none_argument_falls_back_to_default(self):
         tool = self.tool(
             ["echo", "{m}"],
-            m=cliwrap.ParamSpec(name="m", type="string", default="hi"),
+            m=ParamSpec(name="m", type="string", default="hi"),
         )
-        self.assertEqual(["echo", "hi"], cliwrap.render_argv(tool, {"m": None}))
+        self.assertEqual(["echo", "hi"], render_argv(tool, {"m": None}))
 
     def test_missing_required_param_is_error(self):
         tool = self.tool(
             ["echo", "{m}"],
-            m=cliwrap.ParamSpec(name="m", type="string"),
+            m=ParamSpec(name="m", type="string"),
         )
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "required"):
-            cliwrap.render_argv(tool, {})
+        with self.assertRaisesRegex(ParamValidationError, "required"):
+            render_argv(tool, {})
 
     def test_value_stays_single_argv_element(self):
         # 空白やシェルメタ文字を含む値も 1 argv 要素のまま (shell 経路なし)
         tool = self.tool(
             ["echo", "{m}"],
-            m=cliwrap.ParamSpec(name="m", type="string"),
+            m=ParamSpec(name="m", type="string"),
         )
         payload = "a b; rm -rf / && echo $(pwd) | cat"
-        self.assertEqual(["echo", payload], cliwrap.render_argv(tool, {"m": payload}))
+        self.assertEqual(["echo", payload], render_argv(tool, {"m": payload}))
 
     def test_injection_dash_value_rejected_at_render(self):
         tool = self.tool(
             ["gh", "pr", "view", "{number}"],
-            number=cliwrap.ParamSpec(name="number", type="string"),
+            number=ParamSpec(name="number", type="string"),
         )
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "starting with '-'"):
-            cliwrap.render_argv(tool, {"number": "--web"})
+        with self.assertRaisesRegex(ParamValidationError, "starting with '-'"):
+            render_argv(tool, {"number": "--web"})
 
     def test_array_expands_with_forced_flag_after(self):
         tool = self.tool(
             ["gcloud", "{args}", "--project=pinned"],
-            args=cliwrap.ParamSpec(name="args", type="array"),
+            args=ParamSpec(name="args", type="array"),
         )
         self.assertEqual(
             ["gcloud", "compute", "instances", "list", "--project=pinned"],
-            cliwrap.render_argv(tool, {"args": ["compute", "instances", "list"]}),
+            render_argv(tool, {"args": ["compute", "instances", "list"]}),
         )
 
     def test_empty_array_expands_to_zero_elements(self):
         tool = self.tool(
             ["ls", "{args}"],
-            args=cliwrap.ParamSpec(name="args", type="array", required=False, default=[]),
+            args=ParamSpec(name="args", type="array", required=False, default=[]),
         )
-        self.assertEqual(["ls"], cliwrap.render_argv(tool, {}))
+        self.assertEqual(["ls"], render_argv(tool, {}))
 
     def test_array_item_with_spaces_stays_single_element(self):
         tool = self.tool(
             ["echo", "{args}"],
-            args=cliwrap.ParamSpec(name="args", type="array"),
+            args=ParamSpec(name="args", type="array"),
         )
         self.assertEqual(
             ["echo", "a b; rm -rf /"],
-            cliwrap.render_argv(tool, {"args": ["a b; rm -rf /"]}),
+            render_argv(tool, {"args": ["a b; rm -rf /"]}),
         )
 
     def test_missing_required_array_is_error(self):
         tool = self.tool(
             ["ls", "{args}"],
-            args=cliwrap.ParamSpec(name="args", type="array"),
+            args=ParamSpec(name="args", type="array"),
         )
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "required"):
-            cliwrap.render_argv(tool, {})
+        with self.assertRaisesRegex(ParamValidationError, "required"):
+            render_argv(tool, {})
 
     def test_array_in_non_exact_element_rejected_at_render(self):
         # ロード時検証を通らない ToolSpec 直組みへの防御
         tool = self.tool(
             ["echo", "--x={args}"],
-            args=cliwrap.ParamSpec(name="args", type="array"),
+            args=ParamSpec(name="args", type="array"),
         )
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "entire argv element"):
-            cliwrap.render_argv(tool, {"args": ["v"]})
+        with self.assertRaisesRegex(ParamValidationError, "entire argv element"):
+            render_argv(tool, {"args": ["v"]})
 
     def test_multiple_placeholders_in_one_element(self):
         tool = self.tool(
             ["gh", "api", "repos/{repo}/pulls/{number}"],
-            repo=cliwrap.ParamSpec(name="repo", type="string"),
-            number=cliwrap.ParamSpec(name="number", type="integer"),
+            repo=ParamSpec(name="repo", type="string"),
+            number=ParamSpec(name="number", type="integer"),
         )
         self.assertEqual(
             ["gh", "api", "repos/o/r/pulls/12"],
-            cliwrap.render_argv(tool, {"repo": "o/r", "number": 12}),
+            render_argv(tool, {"repo": "o/r", "number": 12}),
         )
 
 
 class RunSyncTest(unittest.TestCase):
-    def tool(self, argv, **kwargs) -> cliwrap.ToolSpec:
-        return cliwrap.ToolSpec(name="t", description="", argv=argv, **kwargs)
+    def tool(self, argv, **kwargs) -> ToolSpec:
+        return ToolSpec(name="t", description="", argv=argv, **kwargs)
 
     def test_stdout_returned(self):
         tool = self.tool([sys.executable, "-c", "print('hello')"])
-        self.assertEqual("hello\n", cliwrap.run_sync(tool, tool.argv))
+        self.assertEqual("hello\n", run_sync(tool, tool.argv))
 
     def test_output_truncated_with_note(self):
         tool = self.tool(
             [sys.executable, "-c", "print('x' * 1000)"], inline_max_output_bytes=100,
         )
-        out = cliwrap.run_sync(tool, tool.argv)
+        out = run_sync(tool, tool.argv)
         self.assertIn("output truncated at 100 bytes", out)
         self.assertLess(len(out), 300)
 
@@ -501,7 +513,7 @@ class RunSyncTest(unittest.TestCase):
         tool = self.tool(
             [sys.executable, "-c", "import sys; sys.stderr.write('boom'); sys.exit(3)"],
         )
-        out = cliwrap.run_sync(tool, tool.argv)
+        out = run_sync(tool, tool.argv)
         self.assertIn("exited with code 3", out)
         self.assertIn("boom", out)
 
@@ -509,12 +521,12 @@ class RunSyncTest(unittest.TestCase):
         tool = self.tool(
             [sys.executable, "-c", "import time; time.sleep(5)"], timeout_sec=1,
         )
-        out = cliwrap.run_sync(tool, tool.argv)
+        out = run_sync(tool, tool.argv)
         self.assertIn("timed out after 1s", out)
 
     def test_missing_binary_returns_error(self):
         tool = self.tool(["/nonexistent/binary"])
-        out = cliwrap.run_sync(tool, tool.argv)
+        out = run_sync(tool, tool.argv)
         self.assertIn("failed to execute", out)
 
 
@@ -527,8 +539,8 @@ class FileOutputModeTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def tool(self, output_mode="file", inline_max_output_bytes=100, argv=None,
-             inline_on_large_output="truncate") -> cliwrap.ToolSpec:
-        return cliwrap.ToolSpec(
+             inline_on_large_output="truncate") -> ToolSpec:
+        return ToolSpec(
             name="t", description="",
             argv=argv or [sys.executable, "-c", "print('x' * 1000)"],
             inline_max_output_bytes=inline_max_output_bytes,
@@ -538,7 +550,7 @@ class FileOutputModeTest(unittest.TestCase):
 
     def test_file_mode_writes_file_holding_full_output(self):
         tool = self.tool()
-        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("full output saved to file", out)
         self.assertIn("1001 bytes", out)  # 総バイト数 (1000 + 改行)
         self.assertIn("offset/limit", out)
@@ -561,7 +573,7 @@ class FileOutputModeTest(unittest.TestCase):
     def test_file_mode_writes_even_small_output(self):
         # file mode は証跡目的なので、上限以下でも常にファイル化する
         tool = self.tool(inline_max_output_bytes=5000)
-        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("full output saved to file", out)
         self.assertEqual(1, len(list(self.file_dir.iterdir())))
 
@@ -570,7 +582,7 @@ class FileOutputModeTest(unittest.TestCase):
             argv=[sys.executable, "-c",
                   "import sys; print('partial'); sys.stderr.write('boom'); sys.exit(3)"],
         )
-        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("exited with code 3", out)
         self.assertIn("output saved to:", out)
         self.assertIn("boom", out)
@@ -583,12 +595,12 @@ class FileOutputModeTest(unittest.TestCase):
         self.assertEqual(3, json.loads((dirs[0] / "meta.json").read_text())["exit_code"])
 
     def test_file_mode_timeout_saves_partial_output(self):
-        tool = cliwrap.ToolSpec(
+        tool = ToolSpec(
             name="t", description="", output_mode="file", timeout_sec=1,
             argv=[sys.executable, "-u", "-c",
                   "import time; print('before-sleep'); time.sleep(5)"],
         )
-        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("timed out after 1s", out)
         self.assertIn("partial output saved to:", out)
         dirs = list(self.file_dir.iterdir())
@@ -602,13 +614,13 @@ class FileOutputModeTest(unittest.TestCase):
 
     def test_inline_truncate_never_writes_file(self):
         tool = self.tool(output_mode="inline")
-        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("output truncated at 100 bytes", out)
         self.assertFalse(self.file_dir.exists())
 
     def test_inline_on_large_output_file_writes_only_on_overflow(self):
         tool = self.tool(output_mode="inline", inline_on_large_output="file")
-        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("full output saved to file", out)  # 超過 → ファイル化 (旧 spill)
         self.assertEqual(1, len(list(self.file_dir.iterdir())))
 
@@ -617,19 +629,19 @@ class FileOutputModeTest(unittest.TestCase):
             output_mode="inline", inline_on_large_output="file",
             inline_max_output_bytes=5000,
         )
-        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertEqual("x" * 1000 + "\n", out)
         self.assertFalse(self.file_dir.exists())
 
     def test_file_mode_without_dir_falls_back_to_truncate(self):
         tool = self.tool()
-        out = cliwrap.run_sync(tool, tool.argv, file_dir=None)
+        out = run_sync(tool, tool.argv, file_dir=None)
         self.assertIn("output truncated at 100 bytes", out)
 
 
 class OutputModeConfigTest(unittest.TestCase):
     def test_invalid_output_mode_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "output_mode"):
+        with self.assertRaisesRegex(ConfigError, "output_mode"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -653,7 +665,7 @@ class OutputModeConfigTest(unittest.TestCase):
         self.assertEqual("truncate", spec.tools["echo"].inline_on_large_output)
 
     def test_invalid_inline_on_large_output_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "inline_on_large_output"):
+        with self.assertRaisesRegex(ConfigError, "inline_on_large_output"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -683,7 +695,7 @@ class OutputModeConfigTest(unittest.TestCase):
         self.assertEqual("file", spec.tools["x"].output_mode)
 
     def test_unknown_defaults_key_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "defaults"):
+        with self.assertRaisesRegex(ConfigError, "defaults"):
             load_yaml(
                 'server: {name: t}\n'
                 'defaults: {timeout: 5}\n'
@@ -717,7 +729,7 @@ class EnvConfigTest(unittest.TestCase):
         self.assertEqual({"SHARED": "base", "PROJECT": "other-proj"}, spec.tools["b"].env)
 
     def test_invalid_env_var_name_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "invalid env var name"):
+        with self.assertRaisesRegex(ConfigError, "invalid env var name"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -727,7 +739,7 @@ class EnvConfigTest(unittest.TestCase):
             )
 
     def test_non_string_env_value_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "must be a string"):
+        with self.assertRaisesRegex(ConfigError, "must be a string"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -737,7 +749,7 @@ class EnvConfigTest(unittest.TestCase):
             )
 
     def test_env_not_mapping_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "env must be a mapping"):
+        with self.assertRaisesRegex(ConfigError, "env must be a mapping"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -747,7 +759,7 @@ class EnvConfigTest(unittest.TestCase):
             )
 
     def test_defaults_env_validated(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "defaults.*invalid env var name"):
+        with self.assertRaisesRegex(ConfigError, "defaults.*invalid env var name"):
             load_yaml(
                 'server: {name: t}\n'
                 'defaults:\n'
@@ -760,14 +772,14 @@ class EnvConfigTest(unittest.TestCase):
 class EnvExecTest(unittest.TestCase):
     PRINT_VAR = "import os; print(os.environ.get('CLIWRAP_TEST_VAR', '(unset)'))"
 
-    def tool(self, env) -> cliwrap.ToolSpec:
-        return cliwrap.ToolSpec(
+    def tool(self, env) -> ToolSpec:
+        return ToolSpec(
             name="t", description="", argv=[sys.executable, "-c", self.PRINT_VAR], env=env,
         )
 
     def test_run_sync_forces_env_var(self):
         tool = self.tool({"CLIWRAP_TEST_VAR": "forced"})
-        self.assertEqual("forced\n", cliwrap.run_sync(tool, tool.argv))
+        self.assertEqual("forced\n", run_sync(tool, tool.argv))
 
     def test_forced_env_overrides_inherited(self):
         import os
@@ -775,19 +787,19 @@ class EnvExecTest(unittest.TestCase):
         os.environ["CLIWRAP_TEST_VAR"] = "parent"
         self.addCleanup(os.environ.pop, "CLIWRAP_TEST_VAR", None)
         tool = self.tool({"CLIWRAP_TEST_VAR": "forced"})
-        self.assertEqual("forced\n", cliwrap.run_sync(tool, tool.argv))
+        self.assertEqual("forced\n", run_sync(tool, tool.argv))
 
     def test_parent_env_still_inherited_alongside_forced(self):
         import os
 
         os.environ["CLIWRAP_OTHER_VAR"] = "inherited"
         self.addCleanup(os.environ.pop, "CLIWRAP_OTHER_VAR", None)
-        tool = cliwrap.ToolSpec(
+        tool = ToolSpec(
             name="t", description="",
             argv=[sys.executable, "-c", "import os; print(os.environ['CLIWRAP_OTHER_VAR'])"],
             env={"CLIWRAP_TEST_VAR": "forced"},
         )
-        self.assertEqual("inherited\n", cliwrap.run_sync(tool, tool.argv))
+        self.assertEqual("inherited\n", run_sync(tool, tool.argv))
 
     def test_no_env_config_inherits_parent(self):
         import os
@@ -795,12 +807,12 @@ class EnvExecTest(unittest.TestCase):
         os.environ["CLIWRAP_TEST_VAR"] = "parent"
         self.addCleanup(os.environ.pop, "CLIWRAP_TEST_VAR", None)
         tool = self.tool({})
-        self.assertEqual("parent\n", cliwrap.run_sync(tool, tool.argv))
+        self.assertEqual("parent\n", run_sync(tool, tool.argv))
 
     def test_job_start_forces_env_var(self):
         with tempfile.TemporaryDirectory() as tmp:
-            jobs = cliwrap.JobManager(Path(tmp) / "jobs")
-            tool = cliwrap.ToolSpec(
+            jobs = JobManager(Path(tmp) / "jobs")
+            tool = ToolSpec(
                 name="j", description="", argv=[], mode="job",
                 env={"CLIWRAP_TEST_VAR": "forced"},
             )
@@ -837,7 +849,7 @@ class OutputDirTest(unittest.TestCase):
         return content[0].text
 
     def server(self):
-        return cliwrap.build_server(load_yaml(MINIMAL), cache_dir=Path(self._tmp.name))
+        return build_server(load_yaml(MINIMAL), cache_dir=Path(self._tmp.name))
 
     def test_call_file_output_dir_forces_file_even_for_small_output(self):
         out = self.call(self.server(), "echo", {"msg": "hi", "file_output_dir": self.dest})
@@ -878,7 +890,7 @@ class OutputDirTest(unittest.TestCase):
         import anyio
 
         spec = load_yaml(JobConfigTest.JOB_YAML)
-        server = cliwrap.build_server(spec, cache_dir=Path(self._tmp.name))
+        server = build_server(spec, cache_dir=Path(self._tmp.name))
         for tool in anyio.run(server.list_tools):
             self.assertNotIn("file_output_dir", tool.inputSchema["properties"], tool.name)
 
@@ -891,14 +903,14 @@ class OutputDirTest(unittest.TestCase):
             '    inline_max_output_bytes: 100\n'
             f'    argv: ["{sys.executable}", "-c", "print(\'x\' * 1000)"]\n'
         )
-        server = cliwrap.build_server(spec, cache_dir=Path(self._tmp.name))
+        server = build_server(spec, cache_dir=Path(self._tmp.name))
         out = self.call(server, "big", {"file_output_dir": self.dest})
         self.assertIn("1001 bytes", out)
         dirs = list(Path(self.dest).iterdir())
         self.assertEqual(b"x" * 1000 + b"\n", (dirs[0] / "stdout.log").read_bytes())  # 全量
 
     def test_reserved_param_name_is_config_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "reserved"):
+        with self.assertRaisesRegex(ConfigError, "reserved"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -927,7 +939,7 @@ class FileOutputDirConfigTest(unittest.TestCase):
         return content[0].text
 
     def test_relative_path_is_config_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "absolute path"):
+        with self.assertRaisesRegex(ConfigError, "absolute path"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -954,7 +966,7 @@ class FileOutputDirConfigTest(unittest.TestCase):
             f'    file_output_dir: {self.root}\n'
             f'    argv: ["{sys.executable}", "-c", "print(\'hi\')"]\n'
         )
-        server = cliwrap.build_server(spec, cache_dir=self.cache)
+        server = build_server(spec, cache_dir=self.cache)
         out = self.call(server, "say", {})
         self.assertIn(str(self.root / "outputs"), out)
         dirs = list((self.root / "outputs").iterdir())
@@ -971,7 +983,7 @@ class FileOutputDirConfigTest(unittest.TestCase):
             f'    file_output_dir: {self.root}\n'
             f'    argv: ["{sys.executable}", "-c", "print(\'hi\')"]\n'
         )
-        server = cliwrap.build_server(spec, cache_dir=self.cache)
+        server = build_server(spec, cache_dir=self.cache)
         dest = str(Path(self._tmp.name) / "per-call")
         out = self.call(server, "say", {"file_output_dir": dest})
         self.assertIn(dest, out)
@@ -987,7 +999,7 @@ class FileOutputDirConfigTest(unittest.TestCase):
             f'    file_output_dir: {self.root}\n'
             f'    argv: ["{sys.executable}", "-c", "print(\'job-out\')"]\n'
         )
-        server = cliwrap.build_server(spec, cache_dir=self.cache)
+        server = build_server(spec, cache_dir=self.cache)
         out = self.call(server, "task_start", {})
         self.assertIn("job started:", out)
         self.assertIn(str(self.root / "jobs"), out)
@@ -999,8 +1011,8 @@ class FileOutputDirConfigTest(unittest.TestCase):
 class JobModeTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.jobs = cliwrap.JobManager(Path(self._tmp.name) / "jobs")
-        self.tool = cliwrap.ToolSpec(
+        self.jobs = JobManager(Path(self._tmp.name) / "jobs")
+        self.tool = ToolSpec(
             name="j", description="", argv=[], mode="job", inline_max_output_bytes=10_000,
         )
 
@@ -1072,11 +1084,11 @@ class JobModeTest(unittest.TestCase):
 
     def test_malformed_job_id_rejected(self):
         for bad in ("../../etc/passwd", "x; rm -rf /", "20260715T000000-XYZ!!", ""):
-            with self.assertRaisesRegex(cliwrap.ParamValidationError, "invalid job_id"):
+            with self.assertRaisesRegex(ParamValidationError, "invalid job_id"):
                 self.jobs.status(bad)
 
     def test_unknown_but_wellformed_job_id_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ParamValidationError, "unknown job_id"):
+        with self.assertRaisesRegex(ParamValidationError, "unknown job_id"):
             self.jobs.status("20260101T000000-abc123")
 
 
@@ -1097,7 +1109,7 @@ class JobConfigTest(unittest.TestCase):
     def test_job_tools_registered_as_four_tools(self):
         spec = load_yaml(self.JOB_YAML)
         with tempfile.TemporaryDirectory() as tmp:
-            server = cliwrap.build_server(spec, cache_dir=Path(tmp))
+            server = build_server(spec, cache_dir=Path(tmp))
             import anyio
 
             names = sorted(t.name for t in anyio.run(server.list_tools))
@@ -1116,11 +1128,11 @@ class JobConfigTest(unittest.TestCase):
         )
         self.assertEqual(
             ["do-work", "a", "b"],
-            cliwrap.render_argv(spec.tools["task"], {"args": ["a", "b"]}),
+            render_argv(spec.tools["task"], {"args": ["a", "b"]}),
         )
 
     def test_exposed_name_collision_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "collision"):
+        with self.assertRaisesRegex(ConfigError, "collision"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
@@ -1132,7 +1144,7 @@ class JobConfigTest(unittest.TestCase):
 class BuildServerTest(unittest.TestCase):
     def test_tools_registered_on_fastmcp(self):
         spec = load_yaml(MINIMAL)
-        server = cliwrap.build_server(spec)
+        server = build_server(spec)
         import anyio
 
         tools = anyio.run(server.list_tools)
@@ -1151,7 +1163,7 @@ class BuildServerTest(unittest.TestCase):
             f'    argv: ["{sys.executable}", "-c", "print(\'ok:\' + \'{{msg}}\')"]\n'
             '    params: {msg: {type: string}}\n'
         )
-        server = cliwrap.build_server(spec)
+        server = build_server(spec)
         import anyio
 
         result = anyio.run(lambda: server.call_tool("pyprint", {"msg": "ping"}))
@@ -1169,7 +1181,7 @@ class BuildServerTest(unittest.TestCase):
     )
 
     def test_array_param_in_input_schema(self):
-        server = cliwrap.build_server(load_yaml(self.ARRAY_YAML))
+        server = build_server(load_yaml(self.ARRAY_YAML))
         import anyio
 
         schema = anyio.run(server.list_tools)[0].inputSchema
@@ -1182,7 +1194,7 @@ class BuildServerTest(unittest.TestCase):
         self.assertEqual({"type": "string"}, array_variants[0]["items"])
 
     def test_call_tool_with_array_argument(self):
-        server = cliwrap.build_server(load_yaml(self.ARRAY_YAML))
+        server = build_server(load_yaml(self.ARRAY_YAML))
         import anyio
 
         result = anyio.run(lambda: server.call_tool("pyargs", {"args": ["a", "b c"]}))
@@ -1190,7 +1202,7 @@ class BuildServerTest(unittest.TestCase):
         self.assertIn("['a', 'b c']", content[0].text)
 
     def test_call_tool_with_array_omitted_uses_empty_default(self):
-        server = cliwrap.build_server(load_yaml(self.ARRAY_YAML))
+        server = build_server(load_yaml(self.ARRAY_YAML))
         import anyio
 
         result = anyio.run(lambda: server.call_tool("pyargs", {}))
