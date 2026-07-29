@@ -50,7 +50,7 @@ TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # エンジンが全 sync ツールに自動注入するパラメータ名 (config での定義は禁止)
-RESERVED_PARAM_NAMES = {"output_dir"}
+RESERVED_PARAM_NAMES = {"file_output_dir"}
 
 # scalar 型の Python 型 (enum / default の型検査に使用)。array は別扱い (items は常に str)
 PY_TYPES: dict[str, type] = {"string": str, "integer": int, "boolean": bool}
@@ -99,6 +99,7 @@ class ToolSpec:
     inline_max_output_bytes: int = DEFAULT_INLINE_MAX_OUTPUT_BYTES
     output_mode: str = "inline"
     inline_on_large_output: str = "truncate"
+    file_output_dir: str | None = None
     params: dict[str, ParamSpec] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
 
@@ -109,6 +110,7 @@ class Defaults:
     output_mode: str = "inline"
     inline_max_output_bytes: int = DEFAULT_INLINE_MAX_OUTPUT_BYTES
     inline_on_large_output: str = "truncate"
+    file_output_dir: str | None = None
     env: dict[str, str] = field(default_factory=dict)
 
 
@@ -214,6 +216,15 @@ def _check_choice(ctx: str, key: str, value: Any, allowed: set[str]) -> None:
         raise ConfigError(f"{ctx}: {key} must be one of {sorted(allowed)}, got {value!r}")
 
 
+def _load_file_output_dir(ctx: str, raw: Any) -> str | None:
+    """`file_output_dir:` (ファイル出力のルート) を検証して返す。"""
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.startswith("/"):
+        raise ConfigError(f"{ctx}: file_output_dir must be an absolute path, got {raw!r}")
+    return raw
+
+
 def _load_env(ctx: str, raw: Any) -> dict[str, str]:
     """`env:` セクション (環境変数名 -> 値) を検証して返す。"""
     if raw is None:
@@ -245,7 +256,7 @@ def _load_tool(
     ctx = f"tools.{name}"
     unknown = set(raw) - {
         "name", "description", "argv", "mode", "timeout_sec", "inline_max_output_bytes",
-        "output_mode", "inline_on_large_output", "params", "env",
+        "output_mode", "inline_on_large_output", "file_output_dir", "params", "env",
     }
     if unknown:
         raise ConfigError(f"{ctx}: unknown keys {sorted(unknown)}")
@@ -278,6 +289,10 @@ def _load_tool(
         ),
         output_mode=output_mode,
         inline_on_large_output=inline_on_large_output,
+        file_output_dir=(
+            _load_file_output_dir(ctx, raw.get("file_output_dir"))
+            or defaults.file_output_dir
+        ),
         params=params,
         # tool の env は server 全体の defaults.env の上にマージ (同名キーは tool 側が勝つ)
         env={**defaults.env, **_load_env(ctx, raw.get("env"))},
@@ -321,7 +336,8 @@ def _load_defaults(raw: Any) -> Defaults:
     if not isinstance(raw, dict):
         raise ConfigError("'defaults' must be a mapping")
     unknown = set(raw) - {
-        "output_mode", "inline_max_output_bytes", "inline_on_large_output", "env",
+        "output_mode", "inline_max_output_bytes", "inline_on_large_output",
+        "file_output_dir", "env",
     }
     if unknown:
         raise ConfigError(f"defaults: unknown keys {sorted(unknown)}")
@@ -331,6 +347,7 @@ def _load_defaults(raw: Any) -> Defaults:
             "inline_max_output_bytes", DEFAULT_INLINE_MAX_OUTPUT_BYTES,
         ),
         inline_on_large_output=raw.get("inline_on_large_output", "truncate"),
+        file_output_dir=_load_file_output_dir("defaults", raw.get("file_output_dir")),
         env=_load_env("defaults", raw.get("env")),
     )
     _check_choice("defaults", "output_mode", defaults.output_mode, OUTPUT_MODES)
@@ -573,12 +590,12 @@ def run_sync(
     tool: ToolSpec,
     argv: list[str],
     file_dir: Path | None = None,
-    output_dir: Path | None = None,
+    call_dir: Path | None = None,
 ) -> str:
     started_at = datetime.now(timezone.utc).isoformat()
-    # per-call 指定 (output_dir) または file mode では、成否・サイズに関係なく
-    # 常に全量をファイル化する (証跡: 失敗した実行も記録に残す)
-    dest = output_dir if output_dir is not None else (
+    # per-call 指定 (call_dir = 予約 param file_output_dir) または file mode では、
+    # 成否・サイズに関係なく常に全量をファイル化する (証跡: 失敗した実行も記録に残す)
+    dest = call_dir if call_dir is not None else (
         file_dir if tool.output_mode == "file" else None
     )
     try:
@@ -671,12 +688,13 @@ class JobManager:
     """job モードの状態管理 (MVP)。
 
     サーバープロセス内の Popen 管理を主とし、出力・pid・メタ情報は
-    <cache_dir>/<server>/jobs/<job_id>/ のファイルに残す。サーバー再起動後の
-    孤児 job は best-effort (pid 生存確認と exit_code ファイル) でのみ参照できる。
+    <jobs_dir>/<job_id>/ のファイルに残す (jobs_dir は tool の出力ルート配下の
+    jobs/。既定は cache)。サーバー再起動後の孤児 job は best-effort
+    (pid 生存確認と exit_code ファイル) でのみ参照できる。
     """
 
-    def __init__(self, server_name: str, cache_dir: Path | None = None):
-        self.jobs_dir = (cache_dir or default_cache_dir()) / server_name / "jobs"
+    def __init__(self, jobs_dir: Path):
+        self.jobs_dir = jobs_dir
         self._procs: dict[str, subprocess.Popen] = {}
 
     def _job_dir(self, job_id: str) -> Path:
@@ -799,7 +817,7 @@ def _make_tool_fn(fn_name: str, tool: ToolSpec, invoke, inject_output_dir: bool 
 
     FastMCP は関数シグネチャから inputSchema を作るため、exec で実シグネチャを持つ
     関数を組み立てる。パラメータ名は config ロード時に識別子として検証済み。
-    inject_output_dir=True で予約パラメータ output_dir (optional) を注入する。
+    inject_output_dir=True で予約パラメータ file_output_dir (optional) を注入する。
     """
     required_args: list[str] = []
     optional_args: list[str] = []
@@ -813,7 +831,7 @@ def _make_tool_fn(fn_name: str, tool: ToolSpec, invoke, inject_output_dir: bool 
         else:
             optional_args.append(f"{pname}: {ann} = {spec.default!r}")
     if inject_output_dir:
-        optional_args.append("output_dir: str | None = None")
+        optional_args.append("file_output_dir: str | None = None")
     signature = ", ".join(required_args + optional_args)
     src = (
         f"def {fn_name}({signature}) -> str:\n"
@@ -830,12 +848,15 @@ def build_server(spec: ServerSpec, cache_dir: Path | None = None):
 
     mcp = FastMCP(spec.name, instructions=spec.description)
     server_cache_dir = (cache_dir or default_cache_dir()) / spec.name
-    file_dir = server_cache_dir / "outputs"
-    jobs: JobManager | None = None
-    if any(tool.mode == "job" for tool in spec.tools.values()):
-        jobs = JobManager(spec.name, cache_dir=cache_dir)
+    # 出力ルートは tool の file_output_dir (未指定は cache)。sync は <root>/outputs/、
+    # job は <root>/jobs/ と、証跡が同じルート配下に集約される
+    jobs_by_root: dict[Path, JobManager] = {}
     for tool in spec.tools.values():
-        register_tool(mcp, spec, tool, jobs, file_dir)
+        root = Path(tool.file_output_dir) if tool.file_output_dir else server_cache_dir
+        jobs: JobManager | None = None
+        if tool.mode == "job":
+            jobs = jobs_by_root.setdefault(root, JobManager(root / "jobs"))
+        register_tool(mcp, spec, tool, jobs, root / "outputs")
     return mcp
 
 
@@ -848,25 +869,25 @@ def register_tool(
 ) -> None:
     if tool.mode == "sync":
         def invoke(arguments: dict[str, Any], _tool=tool) -> str:
-            output_dir_arg = arguments.pop("output_dir", None)
-            output_dir: Path | None = None
-            if output_dir_arg is not None:
-                if not str(output_dir_arg).startswith("/"):
-                    return "error: output_dir must be an absolute path (starting with '/')"
-                output_dir = Path(output_dir_arg)
+            call_dir_arg = arguments.pop("file_output_dir", None)
+            call_dir: Path | None = None
+            if call_dir_arg is not None:
+                if not str(call_dir_arg).startswith("/"):
+                    return "error: file_output_dir must be an absolute path (starting with '/')"
+                call_dir = Path(call_dir_arg)
             try:
                 argv = render_argv(_tool, arguments)
             except ParamValidationError as exc:
                 return f"error: {exc}"
             print(f"cliwrap: exec {argv!r}", file=sys.stderr)
-            return run_sync(_tool, argv, file_dir=file_dir, output_dir=output_dir)
+            return run_sync(_tool, argv, file_dir=file_dir, call_dir=call_dir)
 
         fn = _make_tool_fn(f"tool_{tool.name}", tool, invoke, inject_output_dir=True)
         description = (
             _tool_description(tool)
-            + "\n- output_dir (string, optional) — absolute directory path; if set, "
-            "the full stdout is always written to a file there (regardless of size) "
-            "and only the file path + excerpts are returned"
+            + "\n- file_output_dir (string, optional) — absolute directory path; if set, "
+            "the full output is always written under it (regardless of size or exit "
+            "code) and only the file path + excerpts are returned"
         )
         mcp.add_tool(fn, name=tool.name, description=description)
     elif tool.mode == "job":

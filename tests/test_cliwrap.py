@@ -799,7 +799,7 @@ class EnvExecTest(unittest.TestCase):
 
     def test_job_start_forces_env_var(self):
         with tempfile.TemporaryDirectory() as tmp:
-            jobs = cliwrap.JobManager("testsrv", cache_dir=Path(tmp))
+            jobs = cliwrap.JobManager(Path(tmp) / "jobs")
             tool = cliwrap.ToolSpec(
                 name="j", description="", argv=[], mode="job",
                 env={"CLIWRAP_TEST_VAR": "forced"},
@@ -820,7 +820,7 @@ class EnvExecTest(unittest.TestCase):
 
 
 class OutputDirTest(unittest.TestCase):
-    """全 sync ツールに自動注入される output_dir param の挙動。"""
+    """全 sync ツールに自動注入される file_output_dir param の挙動。"""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -839,8 +839,8 @@ class OutputDirTest(unittest.TestCase):
     def server(self):
         return cliwrap.build_server(load_yaml(MINIMAL), cache_dir=Path(self._tmp.name))
 
-    def test_output_dir_forces_file_even_for_small_output(self):
-        out = self.call(self.server(), "echo", {"msg": "hi", "output_dir": self.dest})
+    def test_call_file_output_dir_forces_file_even_for_small_output(self):
+        out = self.call(self.server(), "echo", {"msg": "hi", "file_output_dir": self.dest})
         self.assertIn("full output saved to file", out)
         dirs = list(Path(self.dest).iterdir())  # dir は mkdir -p 相当で自動作成
         self.assertEqual(1, len(dirs))
@@ -848,31 +848,31 @@ class OutputDirTest(unittest.TestCase):
         self.assertIn(str(dirs[0] / "stdout.log"), out)
         self.assertEqual(b"hi\n", (dirs[0] / "stdout.log").read_bytes())  # 小出力でも全量
 
-    def test_without_output_dir_behaves_as_before(self):
+    def test_without_call_file_output_dir_behaves_as_before(self):
         out = self.call(self.server(), "echo", {"msg": "hi"})
         self.assertEqual("hi\n", out)
         self.assertFalse(Path(self.dest).exists())
 
-    def test_relative_output_dir_rejected(self):
-        out = self.call(self.server(), "echo", {"msg": "hi", "output_dir": "rel/dir"})
-        self.assertIn("error: output_dir must be an absolute path", out)
+    def test_relative_call_file_output_dir_rejected(self):
+        out = self.call(self.server(), "echo", {"msg": "hi", "file_output_dir": "rel/dir"})
+        self.assertIn("error: file_output_dir must be an absolute path", out)
 
     def test_write_failure_returns_error_string(self):
         # 既存ファイルの下に dir は作れない → OSError → エラー文字列
         blocker = Path(self._tmp.name) / "blocker"
         blocker.write_text("file")
         out = self.call(
-            self.server(), "echo", {"msg": "hi", "output_dir": str(blocker / "sub")},
+            self.server(), "echo", {"msg": "hi", "file_output_dir": str(blocker / "sub")},
         )
         self.assertIn("error: failed to write output", out)
 
-    def test_output_dir_in_schema_as_optional(self):
+    def test_file_output_dir_in_schema_as_optional(self):
         import anyio
 
         tools = anyio.run(self.server().list_tools)
         schema = tools[0].inputSchema
-        self.assertIn("output_dir", schema["properties"])
-        self.assertNotIn("output_dir", schema.get("required", []))
+        self.assertIn("file_output_dir", schema["properties"])
+        self.assertNotIn("file_output_dir", schema.get("required", []))
 
     def test_job_tools_not_injected(self):
         import anyio
@@ -880,9 +880,9 @@ class OutputDirTest(unittest.TestCase):
         spec = load_yaml(JobConfigTest.JOB_YAML)
         server = cliwrap.build_server(spec, cache_dir=Path(self._tmp.name))
         for tool in anyio.run(server.list_tools):
-            self.assertNotIn("output_dir", tool.inputSchema["properties"], tool.name)
+            self.assertNotIn("file_output_dir", tool.inputSchema["properties"], tool.name)
 
-    def test_output_dir_wins_over_truncate_for_large_output(self):
+    def test_call_file_output_dir_wins_over_truncate_for_large_output(self):
         spec = load_yaml(
             'server: {name: t}\n'
             'tools:\n'
@@ -892,7 +892,7 @@ class OutputDirTest(unittest.TestCase):
             f'    argv: ["{sys.executable}", "-c", "print(\'x\' * 1000)"]\n'
         )
         server = cliwrap.build_server(spec, cache_dir=Path(self._tmp.name))
-        out = self.call(server, "big", {"output_dir": self.dest})
+        out = self.call(server, "big", {"file_output_dir": self.dest})
         self.assertIn("1001 bytes", out)
         dirs = list(Path(self.dest).iterdir())
         self.assertEqual(b"x" * 1000 + b"\n", (dirs[0] / "stdout.log").read_bytes())  # 全量
@@ -903,15 +903,103 @@ class OutputDirTest(unittest.TestCase):
                 'server: {name: t}\n'
                 'tools:\n'
                 '  - name: x\n'
-                '    argv: ["echo", "{output_dir}"]\n'
-                '    params: {output_dir: {type: string}}\n'
+                '    argv: ["echo", "{file_output_dir}"]\n'
+                '    params: {file_output_dir: {type: string}}\n'
             )
+
+
+class FileOutputDirConfigTest(unittest.TestCase):
+    """config レベル file_output_dir (defaults / tool) と出力ルートの解決。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "audit"
+        self.cache = Path(self._tmp.name) / "cache"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def call(self, server, name, args) -> str:
+        import anyio
+
+        result = anyio.run(lambda: server.call_tool(name, args))
+        content = result[0] if isinstance(result, tuple) else result
+        return content[0].text
+
+    def test_relative_path_is_config_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "absolute path"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - {name: x, argv: ["true"], file_output_dir: rel/dir}\n'
+            )
+
+    def test_defaults_inherited_and_tool_wins(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'defaults: {file_output_dir: /srv/default}\n'
+            'tools:\n'
+            '  - {name: a, argv: ["true"]}\n'
+            '  - {name: b, argv: ["true"], file_output_dir: /srv/b}\n'
+        )
+        self.assertEqual("/srv/default", spec.tools["a"].file_output_dir)
+        self.assertEqual("/srv/b", spec.tools["b"].file_output_dir)
+
+    def test_file_mode_writes_under_configured_root(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: say\n'
+            '    output_mode: file\n'
+            f'    file_output_dir: {self.root}\n'
+            f'    argv: ["{sys.executable}", "-c", "print(\'hi\')"]\n'
+        )
+        server = cliwrap.build_server(spec, cache_dir=self.cache)
+        out = self.call(server, "say", {})
+        self.assertIn(str(self.root / "outputs"), out)
+        dirs = list((self.root / "outputs").iterdir())
+        self.assertEqual(1, len(dirs))
+        self.assertEqual(b"hi\n", (dirs[0] / "stdout.log").read_bytes())
+        self.assertFalse(self.cache.exists())  # cache 側には何も書かれない
+
+    def test_per_call_param_wins_over_configured_root(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: say\n'
+            '    output_mode: file\n'
+            f'    file_output_dir: {self.root}\n'
+            f'    argv: ["{sys.executable}", "-c", "print(\'hi\')"]\n'
+        )
+        server = cliwrap.build_server(spec, cache_dir=self.cache)
+        dest = str(Path(self._tmp.name) / "per-call")
+        out = self.call(server, "say", {"file_output_dir": dest})
+        self.assertIn(dest, out)
+        self.assertEqual(1, len(list(Path(dest).iterdir())))
+        self.assertFalse(self.root.exists())
+
+    def test_jobs_live_under_configured_root(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: task\n'
+            '    mode: job\n'
+            f'    file_output_dir: {self.root}\n'
+            f'    argv: ["{sys.executable}", "-c", "print(\'job-out\')"]\n'
+        )
+        server = cliwrap.build_server(spec, cache_dir=self.cache)
+        out = self.call(server, "task_start", {})
+        self.assertIn("job started:", out)
+        self.assertIn(str(self.root / "jobs"), out)
+        jobs = list((self.root / "jobs").iterdir())
+        self.assertEqual(1, len(jobs))
+        self.assertFalse(self.cache.exists())
 
 
 class JobModeTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.jobs = cliwrap.JobManager("testsrv", cache_dir=Path(self._tmp.name))
+        self.jobs = cliwrap.JobManager(Path(self._tmp.name) / "jobs")
         self.tool = cliwrap.ToolSpec(
             name="j", description="", argv=[], mode="job", inline_max_output_bytes=10_000,
         )
@@ -1050,7 +1138,7 @@ class BuildServerTest(unittest.TestCase):
         tools = anyio.run(server.list_tools)
         self.assertEqual(["echo"], [t.name for t in tools])
         schema = tools[0].inputSchema
-        self.assertEqual(["msg", "output_dir"], list(schema["properties"]))
+        self.assertEqual(["msg", "file_output_dir"], list(schema["properties"]))
         self.assertEqual(["msg"], schema.get("required", []))
         self.assertEqual("string", schema["properties"]["msg"]["type"])
 
