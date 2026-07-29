@@ -37,7 +37,10 @@ DEFAULT_TIMEOUT_SEC = 60
 DEFAULT_MAX_OUTPUT_BYTES = 50_000
 STDERR_TAIL_BYTES = 2_000
 SPILL_EXCERPT_BYTES = 1_000
-ON_LARGE_OUTPUT_MODES = {"truncate", "spill"}
+# 出力の返し方。切り詰め/書き出しの閾値はどちらも max_output_bytes:
+# - inline: 応答にそのまま含める (上限超過分は切り詰め)
+# - file:   上限超過時はファイルへ書き出してパス+抜粋を返す (上限以下は inline)
+OUTPUT_MODES = {"inline", "file"}
 
 PARAM_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -91,7 +94,7 @@ class ToolSpec:
     mode: str = "sync"
     timeout_sec: int = DEFAULT_TIMEOUT_SEC
     max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES
-    on_large_output: str = "truncate"
+    output_mode: str = "inline"
     params: dict[str, ParamSpec] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
 
@@ -215,7 +218,7 @@ def _load_env(ctx: str, raw: Any) -> dict[str, str]:
 
 def _load_tool(
     raw: dict[str, Any],
-    default_on_large_output: str = "truncate",
+    default_output_mode: str = "inline",
     default_env: dict[str, str] | None = None,
 ) -> ToolSpec:
     name = raw.get("name")
@@ -224,15 +227,15 @@ def _load_tool(
     ctx = f"tools.{name}"
     unknown = set(raw) - {
         "name", "description", "argv", "mode", "timeout_sec", "max_output_bytes",
-        "on_large_output", "params", "env",
+        "output_mode", "params", "env",
     }
     if unknown:
         raise ConfigError(f"{ctx}: unknown keys {sorted(unknown)}")
-    on_large_output = raw.get("on_large_output", default_on_large_output)
-    if on_large_output not in ON_LARGE_OUTPUT_MODES:
+    output_mode = raw.get("output_mode", default_output_mode)
+    if output_mode not in OUTPUT_MODES:
         raise ConfigError(
-            f"{ctx}: on_large_output must be one of {sorted(ON_LARGE_OUTPUT_MODES)}, "
-            f"got {on_large_output!r}"
+            f"{ctx}: output_mode must be one of {sorted(OUTPUT_MODES)}, "
+            f"got {output_mode!r}"
         )
     argv = raw.get("argv")
     if not argv or not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
@@ -255,7 +258,7 @@ def _load_tool(
         mode=mode,
         timeout_sec=raw.get("timeout_sec", DEFAULT_TIMEOUT_SEC),
         max_output_bytes=raw.get("max_output_bytes", DEFAULT_MAX_OUTPUT_BYTES),
-        on_large_output=on_large_output,
+        output_mode=output_mode,
         params=params,
         # tool の env は server 全体の defaults.env の上にマージ (同名キーは tool 側が勝つ)
         env={**(default_env or {}), **_load_env(ctx, raw.get("env"))},
@@ -308,15 +311,15 @@ def load_config(path: str | Path) -> ServerSpec:
     defaults_raw = raw.get("defaults") or {}
     if not isinstance(defaults_raw, dict):
         raise ConfigError("'defaults' must be a mapping")
-    unknown_defaults = set(defaults_raw) - {"on_large_output", "env"}
+    unknown_defaults = set(defaults_raw) - {"output_mode", "env"}
     if unknown_defaults:
         raise ConfigError(f"defaults: unknown keys {sorted(unknown_defaults)}")
     default_env = _load_env("defaults", defaults_raw.get("env"))
-    default_olo = defaults_raw.get("on_large_output", "truncate")
-    if default_olo not in ON_LARGE_OUTPUT_MODES:
+    default_output_mode = defaults_raw.get("output_mode", "inline")
+    if default_output_mode not in OUTPUT_MODES:
         raise ConfigError(
-            f"defaults.on_large_output must be one of {sorted(ON_LARGE_OUTPUT_MODES)}, "
-            f"got {default_olo!r}"
+            f"defaults.output_mode must be one of {sorted(OUTPUT_MODES)}, "
+            f"got {default_output_mode!r}"
         )
     tools_raw = raw.get("tools") or []
     if not isinstance(tools_raw, list):
@@ -324,7 +327,9 @@ def load_config(path: str | Path) -> ServerSpec:
     for tool_raw in tools_raw:
         if not isinstance(tool_raw, dict):
             raise ConfigError("each tools entry must be a mapping")
-        tool = _load_tool(tool_raw, default_on_large_output=default_olo, default_env=default_env)
+        tool = _load_tool(
+            tool_raw, default_output_mode=default_output_mode, default_env=default_env,
+        )
         if tool.name in server.tools:
             raise ConfigError(f"duplicate tool name: {tool.name}")
         server.tools[tool.name] = tool
@@ -484,11 +489,11 @@ def _file_reply(data: bytes, path: Path, reason: str = "") -> str:
     )
 
 
-def _spill_output(tool: ToolSpec, data: bytes, spill_dir: Path) -> str:
+def _overflow_to_file(tool: ToolSpec, data: bytes, file_dir: Path) -> str:
     try:
-        path = _write_output_file(tool, data, spill_dir)
+        path = _write_output_file(tool, data, file_dir)
     except OSError as exc:
-        print(f"cliwrap: spill failed ({exc}); falling back to truncate", file=sys.stderr)
+        print(f"cliwrap: file output failed ({exc}); falling back to truncate", file=sys.stderr)
         return _truncate(data, tool.max_output_bytes)
     return _file_reply(data, path, reason=f" (> {tool.max_output_bytes})")
 
@@ -506,7 +511,7 @@ def _exec_env(tool: ToolSpec) -> dict[str, str] | None:
 def run_sync(
     tool: ToolSpec,
     argv: list[str],
-    spill_dir: Path | None = None,
+    file_dir: Path | None = None,
     output_dir: Path | None = None,
 ) -> str:
     try:
@@ -536,10 +541,10 @@ def run_sync(
         return _file_reply(proc.stdout, path)
     if (
         len(proc.stdout) > tool.max_output_bytes
-        and tool.on_large_output == "spill"
-        and spill_dir is not None
+        and tool.output_mode == "file"
+        and file_dir is not None
     ):
-        return _spill_output(tool, proc.stdout, spill_dir)
+        return _overflow_to_file(tool, proc.stdout, file_dir)
     return _truncate(proc.stdout, tool.max_output_bytes)
 
 
@@ -731,12 +736,12 @@ def build_server(spec: ServerSpec, cache_dir: Path | None = None):
 
     mcp = FastMCP(spec.name, instructions=spec.description)
     server_cache_dir = (cache_dir or default_cache_dir()) / spec.name
-    spill_dir = server_cache_dir / "outputs"
+    file_dir = server_cache_dir / "outputs"
     jobs: JobManager | None = None
     if any(tool.mode == "job" for tool in spec.tools.values()):
         jobs = JobManager(spec.name, cache_dir=cache_dir)
     for tool in spec.tools.values():
-        register_tool(mcp, spec, tool, jobs, spill_dir)
+        register_tool(mcp, spec, tool, jobs, file_dir)
     return mcp
 
 
@@ -745,7 +750,7 @@ def register_tool(
     server_spec: ServerSpec,
     tool: ToolSpec,
     jobs: JobManager | None,
-    spill_dir: Path | None = None,
+    file_dir: Path | None = None,
 ) -> None:
     if tool.mode == "sync":
         def invoke(arguments: dict[str, Any], _tool=tool) -> str:
@@ -760,7 +765,7 @@ def register_tool(
             except ParamValidationError as exc:
                 return f"error: {exc}"
             print(f"cliwrap: exec {argv!r}", file=sys.stderr)
-            return run_sync(_tool, argv, spill_dir=spill_dir, output_dir=output_dir)
+            return run_sync(_tool, argv, file_dir=file_dir, output_dir=output_dir)
 
         fn = _make_tool_fn(f"tool_{tool.name}", tool, invoke, inject_output_dir=True)
         description = (

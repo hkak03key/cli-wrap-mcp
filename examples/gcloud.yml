@@ -34,7 +34,7 @@ tools:
     # The forced flag comes AFTER {args} so it overrides anything the model sent.
     argv: ["gcloud", "{args}", "--project=my-project"]
     timeout_sec: 120
-    on_large_output: spill
+    output_mode: file
     env:
       CLOUDSDK_CORE_PROJECT: my-project
       # Point at an isolated gcloud configuration dir holding the credentials
@@ -70,7 +70,7 @@ tools:
       - --project=my-project
       - --impersonate-service-account=restricted-sa@my-project.iam.gserviceaccount.com
     timeout_sec: 120
-    on_large_output: spill
+    output_mode: file
     env:
       CLOUDSDK_CORE_PROJECT: my-project
       # Same impersonation at the env layer (belt and braces: flags beat env,

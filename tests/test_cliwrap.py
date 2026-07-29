@@ -518,75 +518,75 @@ class RunSyncTest(unittest.TestCase):
         self.assertIn("failed to execute", out)
 
 
-class SpillTest(unittest.TestCase):
+class FileOutputModeTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.spill_dir = Path(self._tmp.name) / "outputs"
+        self.file_dir = Path(self._tmp.name) / "outputs"
 
     def tearDown(self):
         self._tmp.cleanup()
 
-    def tool(self, on_large_output="spill", max_output_bytes=100) -> cliwrap.ToolSpec:
+    def tool(self, output_mode="file", max_output_bytes=100) -> cliwrap.ToolSpec:
         return cliwrap.ToolSpec(
             name="t", description="",
             argv=[sys.executable, "-c", "print('x' * 1000)"],
             max_output_bytes=max_output_bytes,
-            on_large_output=on_large_output,
+            output_mode=output_mode,
         )
 
-    def test_spill_fires_and_file_holds_full_output(self):
+    def test_overflow_writes_file_holding_full_output(self):
         tool = self.tool()
-        out = cliwrap.run_sync(tool, tool.argv, spill_dir=self.spill_dir)
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("full output saved to file", out)
         self.assertIn("1001 bytes", out)  # 総バイト数 (1000 + 改行)
         self.assertIn("offset/limit", out)
-        files = list(self.spill_dir.iterdir())
+        files = list(self.file_dir.iterdir())
         self.assertEqual(1, len(files))
         self.assertTrue(files[0].name.startswith("t-"))
         self.assertIn(str(files[0]), out)  # 絶対パスが返り値に含まれる
         self.assertEqual(b"x" * 1000 + b"\n", files[0].read_bytes())  # 全量・無切り詰め
 
-    def test_spill_not_fired_when_under_limit(self):
+    def test_under_limit_stays_inline(self):
         tool = self.tool(max_output_bytes=5000)
-        out = cliwrap.run_sync(tool, tool.argv, spill_dir=self.spill_dir)
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertEqual("x" * 1000 + "\n", out)  # 従来どおり本文をそのまま返す
-        self.assertFalse(self.spill_dir.exists())
+        self.assertFalse(self.file_dir.exists())
 
-    def test_truncate_mode_never_writes_file(self):
-        tool = self.tool(on_large_output="truncate")
-        out = cliwrap.run_sync(tool, tool.argv, spill_dir=self.spill_dir)
+    def test_inline_mode_never_writes_file(self):
+        tool = self.tool(output_mode="inline")
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("output truncated at 100 bytes", out)
-        self.assertFalse(self.spill_dir.exists())
+        self.assertFalse(self.file_dir.exists())
 
-    def test_spill_without_dir_falls_back_to_truncate(self):
+    def test_file_mode_without_dir_falls_back_to_truncate(self):
         tool = self.tool()
-        out = cliwrap.run_sync(tool, tool.argv, spill_dir=None)
+        out = cliwrap.run_sync(tool, tool.argv, file_dir=None)
         self.assertIn("output truncated at 100 bytes", out)
 
 
-class SpillConfigTest(unittest.TestCase):
-    def test_invalid_on_large_output_is_error(self):
-        with self.assertRaisesRegex(cliwrap.ConfigError, "on_large_output"):
+class OutputModeConfigTest(unittest.TestCase):
+    def test_invalid_output_mode_is_error(self):
+        with self.assertRaisesRegex(cliwrap.ConfigError, "output_mode"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
-                '  - {name: x, argv: ["true"], on_large_output: keep}\n'
+                '  - {name: x, argv: ["true"], output_mode: spill}\n'
             )
 
     def test_defaults_inherited_and_overridable(self):
         spec = load_yaml(
             'server: {name: t}\n'
-            'defaults: {on_large_output: spill}\n'
+            'defaults: {output_mode: file}\n'
             'tools:\n'
             '  - {name: a, argv: ["true"]}\n'
-            '  - {name: b, argv: ["true"], on_large_output: truncate}\n'
+            '  - {name: b, argv: ["true"], output_mode: inline}\n'
         )
-        self.assertEqual("spill", spec.tools["a"].on_large_output)
-        self.assertEqual("truncate", spec.tools["b"].on_large_output)
+        self.assertEqual("file", spec.tools["a"].output_mode)
+        self.assertEqual("inline", spec.tools["b"].output_mode)
 
-    def test_default_is_truncate(self):
+    def test_default_is_inline(self):
         spec = load_yaml(MINIMAL)
-        self.assertEqual("truncate", spec.tools["echo"].on_large_output)
+        self.assertEqual("inline", spec.tools["echo"].output_mode)
 
     def test_unknown_defaults_key_is_error(self):
         with self.assertRaisesRegex(cliwrap.ConfigError, "defaults"):
