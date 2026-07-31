@@ -125,30 +125,6 @@ From a Claude Code plugin, ship only your configs and reference them via
 }
 ```
 
-### Known limitation: driving the server with a shell pipe
-
-Feeding a batch of requests in from a shell pipe can lose the reply to the last
-one. When stdin reaches EOF, the MCP Python SDK cancels request handlers that are
-still running, so the command executes but its response is never written:
-
-```sh
-# id 5 runs (visible on stderr), but out.jsonl holds only ids 1, 3 and 4
-{
-  echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}'
-  echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
-  echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"say","arguments":{"message":"a"}}}'
-  echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"say","arguments":{"message":"b"}}}'
-  echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"say","arguments":{"message":"c"}}}'
-} | cli-wrap-mcp --config examples/echo.yml >out.jsonl 2>err.log
-```
-
-This is an upstream bug in
-[`modelcontextprotocol/python-sdk`](https://github.com/modelcontextprotocol/python-sdk),
-present from 1.27.0 onward (the pinned 1.28.1 included). Clients that read the
-response before closing stdin — every real MCP client — are unaffected, so it only
-bites ad-hoc probing from a shell. To probe by hand, drive the server from a client
-that waits for each reply instead of a pipe.
-
 ## Config reference
 
 Top level:
@@ -248,6 +224,17 @@ best-effort). `<root>` resolution: per-call `file_output_dir` param > tool
 Job logs and metadata persist under `<root>/jobs/` (the tool's `file_output_dir`,
 or the cache dir), so finished jobs remain inspectable (best-effort) even across
 server restarts. See [`examples/sleep-job.yml`](examples/sleep-job.yml).
+
+## Known limitations
+
+**A shell pipe loses the tail of the replies.** Piping a batch of requests into the
+server can leave the last ones unanswered: when stdin reaches EOF, the MCP Python
+SDK tears the session down without waiting for the requests it is still handling,
+so the command runs but its response is never written. Clients that read each reply
+before closing stdin do not hit this, so it only affects probing by hand from a
+shell — to try a config out interactively, drive the server from a waiting client.
+[Issue #7](https://github.com/hkak03key/cli-wrap-mcp/issues/7) carries the
+reproduction and the upstream status.
 
 ## Development
 
