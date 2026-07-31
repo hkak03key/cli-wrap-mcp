@@ -125,6 +125,30 @@ From a Claude Code plugin, ship only your configs and reference them via
 }
 ```
 
+### Known limitation: driving the server with a shell pipe
+
+Feeding a batch of requests in from a shell pipe can lose the reply to the last
+one. When stdin reaches EOF, the MCP Python SDK cancels request handlers that are
+still running, so the command executes but its response is never written:
+
+```sh
+# id 5 runs (visible on stderr), but out.jsonl holds only ids 1, 3 and 4
+{
+  echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}'
+  echo '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+  echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"say","arguments":{"message":"a"}}}'
+  echo '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"say","arguments":{"message":"b"}}}'
+  echo '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"say","arguments":{"message":"c"}}}'
+} | cli-wrap-mcp --config examples/echo.yml >out.jsonl 2>err.log
+```
+
+This is an upstream bug in
+[`modelcontextprotocol/python-sdk`](https://github.com/modelcontextprotocol/python-sdk),
+present from 1.27.0 onward (the pinned 1.28.1 included). Clients that read the
+response before closing stdin — every real MCP client — are unaffected, so it only
+bites ad-hoc probing from a shell. To probe by hand, drive the server from a client
+that waits for each reply instead of a pipe.
+
 ## Config reference
 
 Top level:
