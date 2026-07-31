@@ -76,21 +76,24 @@ as above. The wrapped CLI runs with your local privileges.
 Requires Python >= 3.11. With [uv](https://docs.astral.sh/uv/):
 
 ```sh
-uvx cli-wrap-mcp@0.1.0 --config /path/to/config.yml
+uvx cli-wrap-mcp@0.2.1 --config /path/to/config.yml
 ```
 
 Or straight from git (pin a tag, or a commit SHA for full immutability):
 
 ```sh
-uvx --from git+https://github.com/hkak03key/cli-wrap-mcp@v0.1.0 cli-wrap-mcp --config /path/to/config.yml
+uvx --from git+https://github.com/hkak03key/cli-wrap-mcp@v0.2.1 cli-wrap-mcp --config /path/to/config.yml
 uvx --from git+https://github.com/hkak03key/cli-wrap-mcp@<commit-sha> cli-wrap-mcp --config /path/to/config.yml
 ```
 
 Try the bundled examples:
 
 ```sh
-uvx cli-wrap-mcp@0.1.0 --config examples/echo.yml
+uvx cli-wrap-mcp@0.2.1 --config examples/echo.yml
 ```
+
+The server speaks MCP on stdio, so drive it from a client rather than a pipe or a
+file redirect (see [Known limitations](#known-limitations)).
 
 [`examples/gcloud.yml`](examples/gcloud.yml) shows the "arbitrary subcommand with
 forced env vars and options" pattern (variadic `array` param + `deny_pattern` +
@@ -105,7 +108,7 @@ Project `.mcp.json`:
   "mcpServers": {
     "echo-demo": {
       "command": "uvx",
-      "args": ["cli-wrap-mcp@0.1.0", "--config", "./configs/echo.yml"]
+      "args": ["cli-wrap-mcp@0.2.1", "--config", "./configs/echo.yml"]
     }
   }
 }
@@ -119,7 +122,7 @@ From a Claude Code plugin, ship only your configs and reference them via
   "mcpServers": {
     "gh-explorer": {
       "command": "uvx",
-      "args": ["cli-wrap-mcp@0.1.0", "--config", "${CLAUDE_PLUGIN_ROOT}/configs/gh-explorer.yml"]
+      "args": ["cli-wrap-mcp@0.2.1", "--config", "${CLAUDE_PLUGIN_ROOT}/configs/gh-explorer.yml"]
     }
   }
 }
@@ -224,6 +227,31 @@ best-effort). `<root>` resolution: per-call `file_output_dir` param > tool
 Job logs and metadata persist under `<root>/jobs/` (the tool's `file_output_dir`,
 or the cache dir), so finished jobs remain inspectable (best-effort) even across
 server restarts. See [`examples/sleep-job.yml`](examples/sleep-job.yml).
+
+## Known limitations
+
+**Feeding requests in from a pipe or a file loses the tail of the replies.** When
+stdin reaches EOF, the MCP Python SDK tears the session down without waiting for the
+requests it is still handling, so the last ones come back unanswered — the commands
+themselves already ran, to completion or until `timeout_sec` killed them; only the
+responses are never written. A missing reply therefore never means the command was
+skipped, and re-running it repeats its side effects. A `mode: job` command is worse
+off: it keeps running in the background and the lost reply takes its `job_id` with
+it, leaving it findable only under `<root>/jobs/`. How much of the tail goes missing
+depends on timing, so a batch that came back whole once is no guarantee for the next.
+Tracked upstream as
+[python-sdk#2678](https://github.com/modelcontextprotocol/python-sdk/issues/2678).
+
+Closing the server's stdout early is a separate hazard, not covered by that upstream
+issue: the SDK dies on a `BrokenPipeError`. Cut it as early as `… | head -1` and it
+dies before most of the commands run, taking the replies of the ones that did run
+with it.
+
+What keeps a caller clear of both is reading each reply before stdin closes,
+whatever the medium — pasting a batch into a terminal and pressing Ctrl-D drops
+replies just like a pipe does. To try a config out by hand, drive the server from a
+client that waits. [Issue #7](https://github.com/hkak03key/cli-wrap-mcp/issues/7)
+records how both show up here.
 
 ## Development
 
