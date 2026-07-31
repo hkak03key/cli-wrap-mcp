@@ -102,7 +102,7 @@ def register_tool(
             _tool_description(tool)
             + "\n- file_output_dir (string, optional) — absolute directory path; if set, "
             "the full output is always written under it (regardless of size or exit "
-            "code) and only the file path + excerpts are returned"
+            "code) and the reply carries the file path + excerpts"
         )
         mcp.add_tool(fn, name=tool.name, description=description)
     elif tool.mode == "job":

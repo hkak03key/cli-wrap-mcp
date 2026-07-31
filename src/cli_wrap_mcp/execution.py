@@ -72,7 +72,7 @@ def _file_reply(data: bytes, inv_dir: Path, reason: str = "") -> str:
 
     抜粋の予算は head と tail の各 FILE_EXCERPT_BYTES。全量が予算に収まるなら
     枠なしで一度だけ返す (応答が全量なので「全部読むな」の助言も省く)。
-    超えるときだけ両端を抜粋し、あいだに省いたバイト数を示す。
+    超えるときだけ両端を抜粋し、あいだに省いた範囲をファイル内の offset で示す。
     """
     header = (
         f"[cliwrap: output is {len(data)} bytes{reason}; full output saved to file]\n"
@@ -83,12 +83,11 @@ def _file_reply(data: bytes, inv_dir: Path, reason: str = "") -> str:
         return header + data.decode("utf-8", errors="replace")
     head = data[:FILE_EXCERPT_BYTES].decode("utf-8", errors="replace")
     tail = data[-FILE_EXCERPT_BYTES:].decode("utf-8", errors="replace")
-    omitted = len(data) - 2 * FILE_EXCERPT_BYTES
     return (
         f"{header}"
         f"Do not read it whole: use Read with offset/limit, or grep, to inspect parts.\n"
         f"--- head ({FILE_EXCERPT_BYTES} bytes) ---\n{head}\n"
-        f"--- {omitted} bytes omitted ---\n"
+        f"--- bytes {FILE_EXCERPT_BYTES}-{len(data) - FILE_EXCERPT_BYTES} omitted ---\n"
         f"--- tail ({FILE_EXCERPT_BYTES} bytes) ---\n{tail}"
     )
 

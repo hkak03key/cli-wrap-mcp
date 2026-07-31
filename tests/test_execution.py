@@ -13,12 +13,19 @@ from cli_wrap_mcp.spec import FILE_EXCERPT_BYTES, ToolSpec
 
 
 def _numbered_body(nbytes: int) -> bytes:
-    """連番行 (1 行 5 バイト) で nbytes ちょうどの出力を組む (端数は '#' で埋める)。
+    """連番行を nbytes ちょうどに切り詰めた出力を組む。
 
     全行が相異なるので、抜粋の重複や取りこぼしを内容で判定できる。
     """
-    body = "".join(f"{i:04d}\n" for i in range(nbytes // 5)) + "#" * (nbytes % 5)
-    return body.encode()
+    body = "".join(f"{i:04d}\n" for i in range(nbytes // 5 + 1))
+    return body.encode()[:nbytes]
+
+
+class NumberedBodyTest(unittest.TestCase):
+    def test_length_is_exact(self):
+        # 抜粋の境界を突くテストの土台なので、要求バイト数ちょうどであること
+        for nbytes in (0, 1, 4, 5, 2_000, 2_001, 50_005):
+            self.assertEqual(nbytes, len(_numbered_body(nbytes)))
 
 
 class RunSyncTest(unittest.TestCase):
@@ -107,10 +114,10 @@ class FileOutputModeTest(unittest.TestCase):
             **kwargs,
         )
 
-    def excerpts(self, out: str) -> tuple[str, str]:
-        """file reply から head / tail 抜粋の本文を取り出す。"""
-        marker = f"--- head ({FILE_EXCERPT_BYTES} bytes) ---\n"
-        head = out.split(marker, 1)[1].split("\n--- ", 1)[0]
+    def excerpts(self, out: str, omitted: str) -> tuple[str, str]:
+        """file reply から head / tail 抜粋の本文を取り出す (omitted は省略注記の本文)。"""
+        head = out.split(f"--- head ({FILE_EXCERPT_BYTES} bytes) ---\n", 1)[1]
+        head = head.split(f"\n--- {omitted} ---\n", 1)[0]
         tail = out.split(f"--- tail ({FILE_EXCERPT_BYTES} bytes) ---\n", 1)[1]
         return head, tail
 
@@ -132,21 +139,24 @@ class FileOutputModeTest(unittest.TestCase):
         # 予算超過の最小ケース: 両端を抜粋し、省いた 1 バイトを注記する
         body = _numbered_body(2 * FILE_EXCERPT_BYTES + 1)
         tool = self.body_tool(body)
+        omitted = f"bytes {FILE_EXCERPT_BYTES}-{FILE_EXCERPT_BYTES + 1} omitted"
         out = run_sync(tool, tool.argv, file_dir=self.file_dir)
-        head, tail = self.excerpts(out)
+        head, tail = self.excerpts(out, omitted)
         self.assertEqual(body[:FILE_EXCERPT_BYTES].decode(), head)
         self.assertEqual(body[-FILE_EXCERPT_BYTES:].decode(), tail)
-        self.assertIn("--- 1 bytes omitted ---", out)
+        self.assertIn(f"--- {omitted} ---", out)
         self.assertIn("Do not read it whole", out)
 
     def test_file_mode_large_output_omits_the_middle(self):
+        # 省略範囲は stdout.log 内の offset なので、そのまま Read の offset に使える
         body = _numbered_body(5_000)
         tool = self.body_tool(body)
+        omitted = f"bytes {FILE_EXCERPT_BYTES}-{5_000 - FILE_EXCERPT_BYTES} omitted"
         out = run_sync(tool, tool.argv, file_dir=self.file_dir)
-        head, tail = self.excerpts(out)
+        head, tail = self.excerpts(out, omitted)
         self.assertEqual(body[:FILE_EXCERPT_BYTES].decode(), head)
         self.assertEqual(body[-FILE_EXCERPT_BYTES:].decode(), tail)
-        self.assertIn(f"--- {5_000 - 2 * FILE_EXCERPT_BYTES} bytes omitted ---", out)
+        self.assertIn(f"--- {omitted} ---", out)
 
     def test_file_mode_body_within_budget_keeps_multibyte_chars(self):
         # 予算内は分割しないので、抜粋境界に跨る文字が置換文字に化けることがない
