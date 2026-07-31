@@ -157,9 +157,12 @@ class JobManager:
         header = f"job {job_id}: {state}" + (f" (exit code {rc})" if rc is not None else "")
         stdout = _tail_file(jdir / "stdout.log", max_bytes) or "(empty)"
         parts = [header, f"stdout:\n{stdout}"]
-        if rc not in (0, None):
+        # rc is None は state == "unknown" (exit code を確定できなかった) を意味する。
+        # stderr tail は失敗の要約として付けるが、unknown ではその失敗自体が未確定なので
+        # 付けない。一方 is_error は「成功と伝えられない」側に倒すので unknown も立てる
+        if rc is not None and rc != 0:
             parts.append(f"stderr (tail):\n{_tail_file(jdir / 'stderr.log', STDERR_TAIL_BYTES)}")
-        return ToolReply("\n".join(parts), is_error=rc != 0)
+        return ToolReply("\n".join(parts), is_error=rc is None or rc != 0)
 
     def cancel(self, job_id: str) -> ToolReply:
         """実行中の job にプロセスグループごと SIGTERM を送る。
