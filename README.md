@@ -234,15 +234,25 @@ successful run is still `isError: false`.
 
 `isError: true` is set when:
 
-- the wrapped command exits non-zero, times out, or cannot be started
-- a parameter fails validation, or `file_output_dir` is not an absolute path
-- writing the audit trail (`output_mode: file` or `file_output_dir`) fails
+- the wrapped command exits non-zero, times out, or cannot be started. A process
+  killed by a signal reports a negative exit code (`-9` for SIGKILL, `-11` for
+  SIGSEGV) and counts as non-zero
+- a parameter fails validation, `file_output_dir` is not an absolute path, or a
+  `job_id` is malformed or unknown — the `job_id` check applies to every job tool,
+  `<name>_status` and `<name>_cancel` included
+- writing the audit trail (`output_mode: file` or `file_output_dir`) fails. The
+  opportunistic file output of `inline_on_large_output: file` is exempt: it falls
+  back to truncating inline, so the call still succeeds
+- `<name>_cancel` cannot read the job's pid, or fails to deliver SIGTERM
 - `<name>_result` is fetched for a job that exited non-zero, or whose exit code
   could not be determined
 
-`<name>_status`, `<name>_cancel`, and a `<name>_result` on a still-running job report
-their observation and stay `isError: false` — the query itself succeeded. A cancelled
-job's own `<name>_result` reports the signal exit code, and is therefore an error.
+Otherwise a job tool reports its observation and stays `isError: false` — the query
+itself succeeded. That covers `<name>_status` for a job that failed, `<name>_result`
+on a still-running job, and `<name>_cancel` when the process had already exited or
+was already gone. A job killed by the SIGTERM that `<name>_cancel` sends exits with a
+negative code, so its `<name>_result` is an error; a job that traps SIGTERM and exits
+0 is not.
 
 ## Development
 

@@ -94,8 +94,11 @@ def run_sync(
 ) -> ToolReply:
     """コマンドを同期実行し、出力の返し方 (inline / truncate / file) を解決した応答を返す。
 
-    ラップ先が非ゼロ終了・timeout・起動失敗のいずれかなら is_error を立てる
-    (証跡の書き出し失敗も、応答が要求どおり返せていないので失敗として扱う)。
+    ラップ先が非ゼロ終了 (シグナル終了の負値を含む)・timeout・起動失敗のいずれかなら
+    is_error を立てる。全量ファイル化が要求された経路 (call_dir / output_mode: file) の
+    書き出し失敗も、応答が要求どおり返せていないので失敗として扱う。inline 超過時の
+    ファイル化 (inline_on_large_output: file) だけは失敗しても truncate で応答できるため、
+    stderr に警告を出して is_error は立てない。
     """
     started_at = datetime.now(timezone.utc).isoformat()
     # per-call 指定 (call_dir = 予約 param file_output_dir) または file mode では、
