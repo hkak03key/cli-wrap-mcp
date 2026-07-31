@@ -11,6 +11,9 @@
   各 item に同じ検証を適用する (rendering)
 - 引数インジェクション対策: `-` で始まる値は既定で拒否 (per-param の
   allow_dash_prefix = true で明示的に許可可能)
+- argv の置換は単一パス。`{` に隣接しない `{param 名}` だけが placeholder で、
+  それ以外の波括弧はリテラル。format spec・attribute access・conversion は
+  「禁止」ではなく解釈自体が存在しない (rendering)
 - config ロード時に argv 内の未定義プレースホルダはエラー (config)
 - stdout は MCP プロトコル専用。ログ・デバッグ出力は必ず stderr へ
   (全モジュールの print。SafetyInvariantsTest が機械検査)
