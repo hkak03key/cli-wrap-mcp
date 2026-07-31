@@ -9,8 +9,10 @@ import uuid
 from cli_wrap_mcp.spec import ToolSpec
 
 # new_invocation_id() が返す書式の検証用。client 入力の job_id の形式検証にも使うため、
-# 生成側を変えるときは必ずここも揃える (生成と検証を隣接させて 1 箇所で検査できる形に保つ)
-INVOCATION_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}-[0-9a-f]{6}$")
+# 生成側を変えるときは必ずここも揃える (生成と検証を隣接させて 1 箇所で検査できる形に保つ)。
+# 照合は必ず fullmatch で行う: `$` は末尾の改行の手前にもマッチするため、`^...$` +
+# match だと "……-abcdef\n" のような末尾改行付きの値を通してしまう
+INVOCATION_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}-[0-9a-f]{6}")
 
 
 def new_invocation_id() -> str:

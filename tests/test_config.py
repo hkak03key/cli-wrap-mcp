@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from _helpers import JOB_YAML, MINIMAL, load_yaml
+from _helpers import JOB_YAML, MINIMAL, call_tool, load_yaml
 from cli_wrap_mcp.rendering import render_argv
 from cli_wrap_mcp.server import build_server
 from cli_wrap_mcp.spec import ConfigError, DEFAULT_TIMEOUT_SEC
@@ -372,11 +372,7 @@ class FileOutputDirConfigTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def call(self, server, name, args) -> str:
-        import anyio
-
-        result = anyio.run(lambda: server.call_tool(name, args))
-        content = result[0] if isinstance(result, tuple) else result
-        return content[0].text
+        return call_tool(server, name, args).content[0].text
 
     def test_relative_path_is_config_error(self):
         with self.assertRaisesRegex(ConfigError, "absolute path"):

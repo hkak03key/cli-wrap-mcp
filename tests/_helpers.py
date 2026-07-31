@@ -1,9 +1,26 @@
-"""テスト共通のヘルパ (YAML 文字列からの config ロードと最小 config)。"""
+"""テスト共通のヘルパ (YAML 文字列からの config ロード・ツール呼び出し・最小 config)。"""
 import tempfile
 from pathlib import Path
 
 from cli_wrap_mcp.config import load_config
 from cli_wrap_mcp.spec import ServerSpec
+
+
+def call_tool(server, name: str, arguments: dict | None = None):
+    """in-memory client 経由でツールを呼び、client が受け取る CallToolResult を返す。
+
+    isError は本来 client が受け取る側の値なので、FastMCP の戻り値を直接見るのではなく
+    プロトコル境界を実際に通した結果を検査する (outputSchema 検証など、境界越しでしか
+    働かない SDK の処理も一緒に通す)。
+    """
+    import anyio
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    async def run():
+        async with create_connected_server_and_client_session(server) as client:
+            return await client.call_tool(name, arguments or {})
+
+    return anyio.run(run)
 
 
 def load_yaml(text: str) -> ServerSpec:

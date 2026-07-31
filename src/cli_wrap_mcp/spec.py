@@ -51,6 +51,18 @@ class ParamValidationError(Exception):
 
 
 @dataclass
+class ToolReply:
+    """ツール 1 回分の応答 (client へ返す本文と、失敗したかどうか)。
+
+    is_error は MCP の CallToolResult.isError にそのまま載る。本文と独立に持つのは、
+    client に失敗を本文の文字列照合 (`error: ` 前置き等) で判定させないため。
+    """
+
+    text: str
+    is_error: bool = False
+
+
+@dataclass
 class ParamSpec:
     """ツールの 1 パラメータの定義 (型・検証規則・default)。"""
 
