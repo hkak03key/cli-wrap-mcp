@@ -68,26 +68,28 @@ def _write_invocation_dir(
 
 
 def _file_reply(data: bytes, inv_dir: Path, reason: str = "") -> str:
-    """全量ファイルへの参照+抜粋だけを返す (呼び出し側 context の節約)。
+    """全量ファイルへの参照と、出力の抜粋 (予算内に収まるなら全量) を返す。
 
-    抜粋は同じ内容を二度返さない: 全量が FILE_EXCERPT_BYTES 以下なら本文を枠なしで
-    一度だけ返し (応答が全量なので「全部読むな」の助言も省く)、head と tail が
-    重なるサイズでは tail を head の続きから始めて中間部の重複を消す。
+    抜粋の予算は head と tail の各 FILE_EXCERPT_BYTES。全量が予算に収まるなら
+    枠なしで一度だけ返す (応答が全量なので「全部読むな」の助言も省く)。
+    超えるときだけ両端を抜粋し、あいだに省いたバイト数を示す。
     """
     header = (
         f"[cliwrap: output is {len(data)} bytes{reason}; full output saved to file]\n"
         f"file: {inv_dir / 'stdout.log'}\n"
         f"(stderr.log and meta.json with the executed argv are in the same directory)\n"
     )
-    if len(data) <= FILE_EXCERPT_BYTES:
+    if len(data) <= 2 * FILE_EXCERPT_BYTES:
         return header + data.decode("utf-8", errors="replace")
-    head = data[:FILE_EXCERPT_BYTES]
-    tail = data[max(FILE_EXCERPT_BYTES, len(data) - FILE_EXCERPT_BYTES):]
+    head = data[:FILE_EXCERPT_BYTES].decode("utf-8", errors="replace")
+    tail = data[-FILE_EXCERPT_BYTES:].decode("utf-8", errors="replace")
+    omitted = len(data) - 2 * FILE_EXCERPT_BYTES
     return (
         f"{header}"
         f"Do not read it whole: use Read with offset/limit, or grep, to inspect parts.\n"
-        f"--- head ({len(head)} bytes) ---\n{head.decode('utf-8', errors='replace')}\n"
-        f"--- tail ({len(tail)} bytes) ---\n{tail.decode('utf-8', errors='replace')}"
+        f"--- head ({FILE_EXCERPT_BYTES} bytes) ---\n{head}\n"
+        f"--- {omitted} bytes omitted ---\n"
+        f"--- tail ({FILE_EXCERPT_BYTES} bytes) ---\n{tail}"
     )
 
 

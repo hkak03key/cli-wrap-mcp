@@ -9,7 +9,16 @@ from pathlib import Path
 
 from cli_wrap_mcp.execution import run_sync
 from cli_wrap_mcp.jobs import JobManager
-from cli_wrap_mcp.spec import ToolSpec
+from cli_wrap_mcp.spec import FILE_EXCERPT_BYTES, ToolSpec
+
+
+def _numbered_body(nbytes: int) -> bytes:
+    """連番行 (1 行 5 バイト) で nbytes ちょうどの出力を組む (端数は '#' で埋める)。
+
+    全行が相異なるので、抜粋の重複や取りこぼしを内容で判定できる。
+    """
+    body = "".join(f"{i:04d}\n" for i in range(nbytes // 5)) + "#" * (nbytes % 5)
+    return body.encode()
 
 
 class RunSyncTest(unittest.TestCase):
@@ -71,7 +80,6 @@ class FileOutputModeTest(unittest.TestCase):
         out = run_sync(tool, tool.argv, file_dir=self.file_dir)
         self.assertIn("full output saved to file", out)
         self.assertIn("1001 bytes", out)  # 総バイト数 (1000 + 改行)
-        self.assertIn("offset/limit", out)
         dirs = list(self.file_dir.iterdir())
         self.assertEqual(1, len(dirs))
         inv = dirs[0]
@@ -88,55 +96,78 @@ class FileOutputModeTest(unittest.TestCase):
         self.assertEqual(0, meta["exit_code"])
         self.assertIn("started_at", meta)
 
-    def numbered_output_tool(self, lines: int) -> ToolSpec:
-        """1 行 5 バイト (連番 + 改行) の出力を lines 行だけ出す file mode tool。
-
-        全行が相異なるので、抜粋が重複しているかを内容で判定できる。
-        """
+    def body_tool(self, body: bytes, **kwargs) -> ToolSpec:
+        """与えた bytes をそのまま stdout に流す tool (出力を 1 バイト単位で決められる)。"""
+        path = Path(self._tmp.name) / f"body-{len(body)}"
+        path.write_bytes(body)
         return self.tool(
             argv=[sys.executable, "-c",
-                  f'import sys; sys.stdout.write("".join(f"{{i:04d}}\\n" '
-                  f"for i in range({lines})))"],
+                  "import sys; sys.stdout.buffer.write(open(sys.argv[1], 'rb').read())",
+                  str(path)],
+            **kwargs,
         )
 
     def excerpts(self, out: str) -> tuple[str, str]:
         """file reply から head / tail 抜粋の本文を取り出す。"""
-        head_section = out.split("--- head (", 1)[1]
-        head = head_section.split(" bytes) ---\n", 1)[1].split("\n--- tail (", 1)[0]
-        tail_section = out.split("\n--- tail (", 1)[1]
-        return head, tail_section.split(" bytes) ---\n", 1)[1]
+        marker = f"--- head ({FILE_EXCERPT_BYTES} bytes) ---\n"
+        head = out.split(marker, 1)[1].split("\n--- ", 1)[0]
+        tail = out.split(f"--- tail ({FILE_EXCERPT_BYTES} bytes) ---\n", 1)[1]
+        return head, tail
 
-    def test_file_mode_small_output_is_not_repeated(self):
-        # 全量が FILE_EXCERPT_BYTES 以下: head と tail に分けず本文を一度だけ返す
-        tool = self.numbered_output_tool(100)  # 500 bytes
+    def test_file_mode_returns_body_once_within_excerpt_budget(self):
+        # 抜粋予算 (head + tail) ちょうど: 枠に分けず本文を一度だけ返す
+        body = _numbered_body(2 * FILE_EXCERPT_BYTES)
+        tool = self.body_tool(body)
         out = run_sync(tool, tool.argv, file_dir=self.file_dir)
-        body = "".join(f"{i:04d}\n" for i in range(100))
-        self.assertIn("500 bytes", out)
+        self.assertIn(f"{2 * FILE_EXCERPT_BYTES} bytes", out)
+        self.assertIn("full output saved to file", out)
         self.assertNotIn("--- head (", out)
         self.assertNotIn("--- tail (", out)
-        self.assertIn("full output saved to file", out)
-        self.assertTrue(out.endswith(body))
+        self.assertTrue(out.endswith(body.decode()))
         self.assertEqual(1, out.count("0000\n"))  # 先頭行が二度現れない
         # 応答が全量を含むので「全部読むな」の助言は不要
         self.assertNotIn("Do not read it whole", out)
 
-    def test_file_mode_excerpts_do_not_overlap(self):
-        # FILE_EXCERPT_BYTES 超 2 倍以下: tail を head の続きから始めて重複を消す
-        tool = self.numbered_output_tool(300)  # 1500 bytes
+    def test_file_mode_excerpts_one_byte_past_the_budget(self):
+        # 予算超過の最小ケース: 両端を抜粋し、省いた 1 バイトを注記する
+        body = _numbered_body(2 * FILE_EXCERPT_BYTES + 1)
+        tool = self.body_tool(body)
         out = run_sync(tool, tool.argv, file_dir=self.file_dir)
         head, tail = self.excerpts(out)
-        self.assertIn("--- head (1000 bytes) ---", out)
-        self.assertIn("--- tail (500 bytes) ---", out)
-        self.assertEqual("".join(f"{i:04d}\n" for i in range(300)), head + tail)
-
-    def test_file_mode_large_output_keeps_head_and_tail(self):
-        # 2 倍超: 従来どおり先頭と末尾を FILE_EXCERPT_BYTES ずつ抜粋する
-        tool = self.numbered_output_tool(600)  # 3000 bytes
-        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
-        head, tail = self.excerpts(out)
-        self.assertEqual("".join(f"{i:04d}\n" for i in range(200)), head)
-        self.assertEqual("".join(f"{i:04d}\n" for i in range(400, 600)), tail)
+        self.assertEqual(body[:FILE_EXCERPT_BYTES].decode(), head)
+        self.assertEqual(body[-FILE_EXCERPT_BYTES:].decode(), tail)
+        self.assertIn("--- 1 bytes omitted ---", out)
         self.assertIn("Do not read it whole", out)
+
+    def test_file_mode_large_output_omits_the_middle(self):
+        body = _numbered_body(5_000)
+        tool = self.body_tool(body)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        head, tail = self.excerpts(out)
+        self.assertEqual(body[:FILE_EXCERPT_BYTES].decode(), head)
+        self.assertEqual(body[-FILE_EXCERPT_BYTES:].decode(), tail)
+        self.assertIn(f"--- {5_000 - 2 * FILE_EXCERPT_BYTES} bytes omitted ---", out)
+
+    def test_file_mode_body_within_budget_keeps_multibyte_chars(self):
+        # 予算内は分割しないので、抜粋境界に跨る文字が置換文字に化けることがない
+        body = ("あ" * 400).encode()  # 1200 bytes
+        tool = self.body_tool(body)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        self.assertEqual(400, out.count("あ"))
+        self.assertNotIn("�", out)
+
+    def test_inline_on_large_output_file_returns_body_once(self):
+        # 上限超過でファイル化した応答も、全量が予算に収まるなら本文を一度だけ載せる
+        # (載る量が inline_max_output_bytes を超えうる点の裁定は issue #17)
+        body = _numbered_body(500)
+        tool = self.body_tool(
+            body, output_mode="inline", inline_on_large_output="file",
+            inline_max_output_bytes=100,
+        )
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        self.assertIn("(> 100)", out)
+        self.assertEqual(1, out.count("0000\n"))
+        self.assertTrue(out.endswith(body.decode()))
 
     def test_file_mode_writes_even_small_output(self):
         # file mode は証跡目的なので、上限以下でも常にファイル化する
