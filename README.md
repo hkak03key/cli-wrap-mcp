@@ -47,9 +47,12 @@ Safety is the core of this engine, enforced at execution and load time:
 - **Argument-injection guard.** Rendered values starting with `-` are rejected by
   default, so a model cannot smuggle `--force`-style flags into a positional slot.
   Opt out per parameter with `allow_dash_prefix: true`.
-- **Strict placeholders.** `{param}` only — format specs, conversions, attribute or
-  index access (`{p.__class__}`) are load-time errors, as are placeholders that
-  reference undefined parameters.
+- **Strict placeholders.** Substitution is a single pass that only ever replaces
+  `{param}` — an exact declared parameter name. Format specs, conversions and
+  attribute or index access (`{p.__class__}`) are not rejected features, they are
+  not features at all: nothing inside a brace is evaluated. A `{name}` that matches
+  no parameter is a load-time error (see
+  [Braces in argv](#braces-in-argv)).
 - **stdout is protocol-only.** The MCP stdio channel is never polluted; all engine
   logging goes to stderr.
 - **Bounded output.** Inline tool output is truncated at `inline_max_output_bytes`
@@ -146,7 +149,7 @@ Per tool:
 |:----|:---------|:--------|:------------|
 | `name` | yes | — | Tool name, `[A-Za-z0-9_-]+`. Must be unique (including job-generated `_start`/`_status`/`_result`/`_cancel` names). |
 | `description` | no | `name` | Tool description shown to the model. |
-| `argv` | yes | — | Non-empty list of strings. `{param}` placeholders are substituted after validation; each element stays a single argv entry. |
+| `argv` | yes | — | Non-empty list of strings. `{param}` placeholders are substituted after validation; each element stays a single argv entry. Braces that are not a declared parameter are literal (see below). |
 | `mode` | no | `sync` | `sync` (run and return) or `job` (background, see below). |
 | `timeout_sec` | no | `60` | Sync-mode timeout. |
 | `output_mode` | no | inherits `defaults` (`inline`) | `inline`: output is returned in the reply, subject to `inline_max_output_bytes`. `file`: output is **always** written to a file in full — success or failure, any size — and the reply carries the path plus head/tail excerpts (audit trail). |
@@ -168,6 +171,79 @@ Per parameter (`params.<name>`):
 | `enum` | no | — | Allowed values (type-checked at load time; string items for arrays). |
 | `default` | no | — | Used when the argument is omitted (type-checked at load time). |
 | `allow_dash_prefix` | no | `false` | Permit values starting with `-` (off by default; injection guard). Applies per item for arrays. |
+
+### Braces in argv
+
+Substitution is a single pass over each `argv` element, and the **only** thing it
+replaces is `{name}` where `name` is a declared parameter. Everything else is passed
+through untouched, so arguments that carry braces of their own need no escaping:
+
+| `argv` element | result |
+|:----|:----|
+| `"repos/{repo}/pulls/{number}"` | parameters substituted |
+| `"{name: .title, sha: .headRefOid}"` | literal — `jq` object construction |
+| `"{{range .}}{{.number}}{{end}}"` | literal — Go template (a `{name}` next to another brace is never a placeholder) |
+| `"{print $1}"` | literal — `awk` program |
+| `"[print(f'line {i:03d}') for i in range(10)]"` | literal — Python f-string |
+| `"s/a\\{2,3\\}/x/"` | literal — POSIX BRE interval |
+
+The one shape that collides is a **bare parameter-shaped brace** — `{print}`,
+`{sha}`, `%{http_code}` — because that is exactly what a placeholder looks like.
+Escape it with a backslash:
+
+```yaml
+argv:
+  - "curl"
+  - "-w"
+  # rendered as %{http_code} {status} -- escape only the literal one
+  - '%\{http_code} {status}'
+  - "-o"
+  - "/dev/null"
+```
+
+A `{name}` that matches no declared parameter is a **load-time error**, so a forgotten
+escape (or a typo in a parameter name) is reported when the server starts, never
+silently passed to the command:
+
+```
+cliwrap: config error: tools.awk: undefined placeholders in argv (write '\{name}' for a literal brace): ['print']
+```
+
+Backslash is only special immediately before a parameter-shaped brace; anywhere else
+it is an ordinary character (which is why the BRE row above needs no escaping). In
+that one position a run of backslashes is an escape sequence: each `\\` renders one
+`\`, and a leftover `\` escapes the placeholder. So `\{name}` is the literal `{name}`,
+`\\{name}` is a backslash plus the substituted value, and `\\\{name}` is a backslash
+plus the literal `{name}`.
+
+Mind the YAML layer: a **single-quoted** scalar takes the backslash literally
+(`'%\{http_code}'`), while a **double-quoted** one needs it doubled
+(`"%\\{http_code}"`).
+
+> **Upgrading from 0.2.x or earlier.** Nothing that used to load stops loading, and
+> elements that used to be rejected (`{a: .b}`, `{print $1}`, `{}`, an unpaired brace,
+> a BRE interval) now load and pass through. **Only an element that contains a
+> placeholder can change meaning**, in two ways — both because 0.2.x ran such elements
+> through `str.format`:
+>
+> - `{{` / `}}` were collapsed to `{` / `}` there. They are now literal, so
+>   `'{{"count": {n}}}'` must be rewritten as `'{"count": {n}}'`.
+> - a backslash before a placeholder had no meaning. Backslashes in that position are
+>   now an escape sequence, so `'\{name}'` (which used to render a backslash plus the
+>   value) is the literal `{name}`, and each `\\` in the run renders one `\`.
+>
+> An element with no placeholder was passed through verbatim in 0.2.x and still is.
+
+Two shapes have no spelling, both narrow enough to work around by inserting a space:
+a literal `{` directly against a placeholder (`{` + value + `}` — write `{ {name} }`),
+and a literal backslash directly against a literal parameter-shaped brace. Escaping
+anything else is a no-op rather than an error: `'\{print "x"}'` passes the backslash
+through to the command, because the brace that follows is not parameter-shaped.
+
+Escaping applies to `argv` only. Parameter values are substituted in a single pass, so
+braces coming from an argument (or an `array` item) reach the command as-is and are
+never re-interpreted. `default` and `env` values are not templates either: their
+braces are taken literally.
 
 ### Array (variadic) parameters
 

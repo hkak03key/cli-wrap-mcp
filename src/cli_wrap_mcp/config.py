@@ -13,7 +13,7 @@ from typing import Any
 
 import yaml
 
-from cli_wrap_mcp.rendering import placeholders
+from cli_wrap_mcp.rendering import BRACE_HINT, placeholders
 from cli_wrap_mcp.spec import (
     DEFAULT_INLINE_MAX_OUTPUT_BYTES,
     DEFAULT_TIMEOUT_SEC,
@@ -190,10 +190,7 @@ def _load_tool(
 
     referenced: set[str] = set()
     for element in tool.argv:
-        try:
-            names = placeholders(element)
-        except ConfigError as exc:
-            raise ConfigError(f"{ctx}: {exc}") from exc
+        names = placeholders(element)
         referenced.update(names)
         # array param は N 要素に展開されるため、要素全体が placeholder のときだけ許可
         # ("--x={args}" のような埋め込みは 1 要素に潰れてしまい意味が壊れる)
@@ -206,7 +203,9 @@ def _load_tool(
                 )
     undefined = referenced - set(params)
     if undefined:
-        raise ConfigError(f"{ctx}: undefined placeholders in argv: {sorted(undefined)}")
+        raise ConfigError(
+            f"{ctx}: undefined placeholders in argv{BRACE_HINT}: {sorted(undefined)}"
+        )
     for pname in sorted(set(params) - referenced):
         print(f"cliwrap: warning: {ctx}: param {pname!r} is never used in argv", file=sys.stderr)
     # 省略可能 (required=false) かつ default なしのパラメータは argv を組めないので禁止する

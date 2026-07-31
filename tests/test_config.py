@@ -39,32 +39,42 @@ class LoadConfigTest(unittest.TestCase):
                 '  - {name: x, argv: ["echo", "{nope}"]}\n'
             )
 
-    def test_format_spec_in_placeholder_is_error(self):
-        with self.assertRaisesRegex(ConfigError, "format spec"):
-            load_yaml(
-                'server: {name: t}\n'
-                'tools:\n'
-                '  - name: x\n'
-                '    argv: ["echo", "{msg:>5}"]\n'
-                '    params: {msg: {type: string}}\n'
-            )
+    def test_brace_shaped_literals_are_not_placeholders(self):
+        # placeholder は「`{` に隣接しない param 名の形」だけ。他は解釈せず素通しする
+        for element in (
+            "{msg:>5}",              # format spec に見える形
+            "{}",                    # positional に見える形
+            "{msg.__class__}",       # attribute access に見える形
+            "{name: .name}",         # jq object
+            "{{range .}}{{end}}",    # Go template
+            "{print $1}",            # awk
+            "a{", "a}",              # 対にならない波括弧
+        ):
+            with self.subTest(element=element):
+                spec = load_yaml(
+                    'server: {name: t}\n'
+                    'tools:\n'
+                    '  - name: x\n'
+                    f'    argv: ["echo", "{element}"]\n'
+                    '    params: {msg: {type: string, required: false, default: "d"}}\n'
+                )
+                self.assertEqual(["echo", element], render_argv(spec.tools["x"], {}))
 
-    def test_positional_placeholder_is_error(self):
-        with self.assertRaisesRegex(ConfigError, "positional"):
-            load_yaml(
-                'server: {name: t}\n'
-                'tools:\n'
-                '  - {name: x, argv: ["echo", "{}"]}\n'
-            )
+    def test_literal_placeholder_shape_is_escaped_with_backslash(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - {name: x, argv: ["awk", "\\\\{print}"]}\n'
+        )
+        self.assertEqual(["awk", "{print}"], render_argv(spec.tools["x"], {}))
 
-    def test_attribute_access_placeholder_is_error(self):
-        with self.assertRaisesRegex(ConfigError, "attribute/index"):
+    def test_unescaped_placeholder_shape_is_undefined_placeholder_error(self):
+        # escape 忘れは無言で通さずロード時に落とす (`awk '{print}'` など)
+        with self.assertRaisesRegex(ConfigError, r"undefined placeholders.*literal brace"):
             load_yaml(
                 'server: {name: t}\n'
                 'tools:\n'
-                '  - name: x\n'
-                '    argv: ["echo", "{msg.__class__}"]\n'
-                '    params: {msg: {type: string}}\n'
+                '  - {name: x, argv: ["awk", "{print}"]}\n'
             )
 
     def test_invalid_param_name_is_error(self):
@@ -180,6 +190,19 @@ class ArrayConfigTest(unittest.TestCase):
                 '      sub: {type: string}\n'
                 '      args: {type: array}\n'
             )
+
+    def test_array_placeholder_not_filling_element_is_error(self):
+        # 「array は要素全体の placeholder のみ」は他の波括弧を絡めても崩れない
+        for element in ("--x={args}", "{{ {args}", "{args}!"):
+            with self.subTest(element=element):
+                with self.assertRaisesRegex(ConfigError, "entire argv element"):
+                    load_yaml(
+                        'server: {name: t}\n'
+                        'tools:\n'
+                        '  - name: run\n'
+                        f'    argv: ["gcloud", "{element}"]\n'
+                        '    params: {args: {type: array}}\n'
+                    )
 
     def test_optional_array_gets_empty_default(self):
         spec = load_yaml(

@@ -3,42 +3,67 @@
 パラメータ値は検証 (type / pattern fullmatch / deny_pattern / enum / dash guard) を
 通過してから argv 要素に埋め込む。array param は要素全体の placeholder のみに展開を
 許し、各 item に同じ検証を適用する。
+
+置換は str.format ではなく単一パスの明示的な置換で行う (issue #6)。argv 要素のうち
+「`{` に隣接せず、param 名の形をした `{name}`」だけが placeholder で、それ以外の
+波括弧はすべてリテラル。したがって jq の `{a: .b}`・Go template の `{{range .}}`・
+awk の `{print $1}` はそのまま書ける。リテラルの `{name}` (awk の `{print}`、
+curl の `%{http_code}` など) は `\\{name}` と escape する。
 """
 from __future__ import annotations
 
 import re
-import string
 from typing import Any
 
 from cli_wrap_mcp.spec import (
+    PARAM_NAME_PATTERN,
     PY_TYPES,
-    ConfigError,
     ParamSpec,
     ParamValidationError,
     ToolSpec,
 )
 
 
-def placeholders(template: str) -> list[str]:
-    """format テンプレート中のプレースホルダ名を列挙する。
+# 未定義 placeholder は「波括弧を書こうとして踏む」のが大半なので、
+# 「書けない」ではなく「こう書けば書ける」まで案内する (issue #6)
+BRACE_HINT = r" (write '\{name}' for a literal brace)"
 
-    format spec / conversion / ネストしたフィールドアクセスは安全のため禁止する。
-    """
+# placeholder の字形。直前が `{` のものは placeholder ではない
+# (Go template の `{{end}}` を置換しないため。右隣の `}` は見ない: 見てしまうと
+#  jq の `{"count": {n}}` のように `}` が続くだけの placeholder が黙って literal になる)
+_PLACEHOLDER = rf"(?<!\{{)\{{{PARAM_NAME_PATTERN}\}}"
+# 左から 1 回だけ走査する。placeholder の直前の `\` の連なりは escape として解釈し、
+# `\\` 2 つでリテラルの `\` 1 つ、余った `\` 1 つが placeholder を escape する
+# (`\{a}` -> `{a}`、`\\{a}` -> `\` + 置換、`\\\{a}` -> `\` + `{a}`)。
+# placeholder が続かない `\` は素の文字のまま (BRE の `s/a\{2,3\}/x/` は無傷)
+_ELEMENT_RE = re.compile(
+    rf"(?P<backslashes>\\+)(?P<escaped>{_PLACEHOLDER})"
+    rf"|(?P<placeholder>{_PLACEHOLDER})"
+)
+
+
+def _substitute(template: str, resolve) -> str:
+    """argv 要素を 1 パス走査し、placeholder を resolve(name) の返り値で置き換える。"""
+    def replace(m: re.Match[str]) -> str:
+        if (placeholder := m.group("placeholder")) is not None:
+            return resolve(placeholder[1:-1])
+        escaped = m.group("escaped")
+        count = len(m.group("backslashes"))
+        literal = "\\" * (count // 2)
+        return literal + (escaped if count % 2 else resolve(escaped[1:-1]))
+
+    return _ELEMENT_RE.sub(replace, template)
+
+
+def placeholders(template: str) -> list[str]:
+    """argv 要素中のプレースホルダ名を列挙する (escape された `\\{name}` は含まない)。"""
     names: list[str] = []
-    for _literal, field_name, format_spec, conversion in string.Formatter().parse(template):
-        if field_name is None:
-            continue
-        if field_name == "":
-            raise ConfigError(f"positional placeholder '{{}}' is not allowed: {template!r}")
-        if format_spec or conversion:
-            raise ConfigError(
-                f"format spec / conversion is not allowed in placeholder: {template!r}"
-            )
-        if "." in field_name or "[" in field_name:
-            raise ConfigError(
-                f"attribute/index access is not allowed in placeholder: {template!r}"
-            )
-        names.append(field_name)
+
+    def collect(name: str) -> str:
+        names.append(name)
+        return ""
+
+    _substitute(template, collect)
     return names
 
 
@@ -110,6 +135,7 @@ def render_argv(tool: ToolSpec, arguments: dict[str, Any]) -> list[str]:
     """検証済みパラメータで argv テンプレートを埋め、実行可能な argv を返す。
 
     array param は placeholder 単独の要素を N 要素に展開する (0 要素も可)。
+    placeholder 以外の波括弧はリテラル (モジュール docstring 参照)。
     """
     rendered_params: dict[str, str | list[str]] = {}
     for pname, spec in tool.params.items():
@@ -126,9 +152,6 @@ def render_argv(tool: ToolSpec, arguments: dict[str, Any]) -> list[str]:
     argv: list[str] = []
     for element in tool.argv:
         names = placeholders(element)
-        if not names:
-            argv.append(element)
-            continue
         values = {n: rendered_params[n] for n in names}
         list_names = [n for n, v in values.items() if isinstance(v, list)]
         if list_names:
@@ -140,5 +163,5 @@ def render_argv(tool: ToolSpec, arguments: dict[str, Any]) -> list[str]:
                 )
             argv.extend(values[name])
             continue
-        argv.append(element.format(**values))
+        argv.append(_substitute(element, lambda name: values[name]))
     return argv

@@ -23,7 +23,10 @@ SUPPORTED_MODES = {"sync", "job"}
 # (片方だけ変えると検査が形骸化するため、正はここ 1 箇所に置く)
 JOB_TOOL_SUFFIXES = ("start", "status", "result", "cancel")
 
-PARAM_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+# パラメータ名の字形。argv の placeholder 判定 (rendering) も同じ字形から導出するため、
+# アンカーなしのパターンを正として置く (片方だけ変えると placeholder 判定がずれる)
+PARAM_NAME_PATTERN = r"[a-z_][a-z0-9_]*"
+PARAM_NAME_RE = re.compile(rf"^{PARAM_NAME_PATTERN}$")
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
