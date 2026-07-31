@@ -23,6 +23,18 @@ SUPPORTED_MODES = {"sync", "job"}
 # (片方だけ変えると検査が形骸化するため、正はここ 1 箇所に置く)
 JOB_TOOL_SUFFIXES = ("start", "status", "result", "cancel")
 
+# MCP 仕様の tool annotations (tools/list の Tool.annotations) とその型。
+# 値の意味はエンジンが解釈せず、config author の宣言をそのまま配信する
+# (仕様上も hint であって保証ではない)。ただし typo が黙って素通りしないよう、
+# キー集合と型はロード時に全数検査する
+TOOL_ANNOTATION_TYPES: dict[str, type] = {
+    "title": str,
+    "readOnlyHint": bool,
+    "destructiveHint": bool,
+    "idempotentHint": bool,
+    "openWorldHint": bool,
+}
+
 PARAM_NAME_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -85,6 +97,8 @@ class ToolSpec:
     file_output_dir: str | None = None
     params: dict[str, ParamSpec] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
+    # MCP tool annotations (検証済みキーのみ)。job モードでは _start にだけ適用する
+    annotations: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -96,6 +110,7 @@ class Defaults:
     inline_on_large_output: str = "truncate"
     file_output_dir: str | None = None
     env: dict[str, str] = field(default_factory=dict)
+    annotations: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

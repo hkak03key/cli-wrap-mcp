@@ -80,6 +80,58 @@ class BuildServerTest(unittest.TestCase):
         content = result[0] if isinstance(result, tuple) else result
         self.assertIn("[]", content[0].text)
 
+class AnnotationsTest(unittest.TestCase):
+    """config の annotations が tools/list の Tool.annotations に届くか。"""
+
+    def tools(self, yaml_text: str) -> dict:
+        import anyio
+
+        with tempfile.TemporaryDirectory() as tmp:
+            server = build_server(load_yaml(yaml_text), cache_dir=Path(tmp))
+            return {t.name: t for t in anyio.run(server.list_tools)}
+
+    def test_declared_annotations_are_served(self):
+        tool = self.tools(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: x\n'
+            '    argv: ["true"]\n'
+            '    annotations: {title: Read stuff, readOnlyHint: true}\n'
+        )["x"]
+        self.assertEqual("Read stuff", tool.annotations.title)
+        self.assertIs(True, tool.annotations.readOnlyHint)
+        self.assertIsNone(tool.annotations.destructiveHint)  # 未宣言は未設定のまま
+
+    def test_no_annotations_serves_none(self):
+        self.assertIsNone(self.tools(MINIMAL)["echo"].annotations)
+
+    def test_job_start_takes_declaration_and_aux_tools_are_fixed(self):
+        tools = self.tools(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: task\n'
+            '    mode: job\n'
+            '    argv: ["sleep", "1"]\n'
+            '    annotations: {title: Long task, readOnlyHint: false, destructiveHint: true}\n'
+        )
+        self.assertEqual("Long task", tools["task_start"].annotations.title)
+        self.assertIs(False, tools["task_start"].annotations.readOnlyHint)
+        self.assertIs(True, tools["task_start"].annotations.destructiveHint)
+        # 補助ツールは _start の宣言を引き継がず、エンジンの固定値だけを持つ
+        for name in ("task_status", "task_result"):
+            self.assertIs(True, tools[name].annotations.readOnlyHint, name)
+            self.assertIsNone(tools[name].annotations.title, name)
+            self.assertIsNone(tools[name].annotations.destructiveHint, name)
+        self.assertIs(False, tools["task_cancel"].annotations.readOnlyHint)
+        self.assertIsNone(tools["task_cancel"].annotations.title)
+
+    def test_job_aux_tools_fixed_even_without_declaration(self):
+        tools = self.tools(JOB_YAML)
+        self.assertIsNone(tools["task_start"].annotations)
+        self.assertIs(True, tools["task_status"].annotations.readOnlyHint)
+        self.assertIs(False, tools["task_cancel"].annotations.readOnlyHint)
+
+
 class OutputDirTest(unittest.TestCase):
     """全 sync ツールに自動注入される file_output_dir param の挙動。"""
 

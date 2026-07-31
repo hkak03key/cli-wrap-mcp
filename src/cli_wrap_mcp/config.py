@@ -25,6 +25,7 @@ from cli_wrap_mcp.spec import (
     PY_TYPES,
     RESERVED_PARAM_NAMES,
     SUPPORTED_MODES,
+    TOOL_ANNOTATION_TYPES,
     TOOL_NAME_RE,
     ANNOTATIONS,
     ConfigError,
@@ -134,6 +135,34 @@ def _load_env(ctx: str, raw: Any) -> dict[str, str]:
     return env
 
 
+def _load_annotations(ctx: str, raw: Any) -> dict[str, Any]:
+    """`annotations:` セクション (MCP tool annotations) を検証して返す。
+
+    値の意味は解釈せずそのまま配信するが、未知キー (readonlyHint のような typo) が
+    黙って捨てられないよう、キー集合と型はここで全数検査する。
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"{ctx}: annotations must be a mapping of "
+            f"{sorted(TOOL_ANNOTATION_TYPES)} -> value"
+        )
+    unknown = set(raw) - set(TOOL_ANNOTATION_TYPES)
+    if unknown:
+        raise ConfigError(
+            f"{ctx}: unknown annotations keys {sorted(unknown)} "
+            f"(expected one of {sorted(TOOL_ANNOTATION_TYPES)})"
+        )
+    for key, value in raw.items():
+        expected = TOOL_ANNOTATION_TYPES[key]
+        if not isinstance(value, expected):
+            raise ConfigError(
+                f"{ctx}: annotations.{key} must be {expected.__name__}, got {value!r}"
+            )
+    return dict(raw)
+
+
 def _load_tool(
     raw: dict[str, Any],
     defaults: Defaults | None = None,
@@ -147,6 +176,7 @@ def _load_tool(
     unknown = set(raw) - {
         "name", "description", "argv", "mode", "timeout_sec", "inline_max_output_bytes",
         "output_mode", "inline_on_large_output", "file_output_dir", "params", "env",
+        "annotations",
     }
     if unknown:
         raise ConfigError(f"{ctx}: unknown keys {sorted(unknown)}")
@@ -186,6 +216,12 @@ def _load_tool(
         params=params,
         # tool の env は server 全体の defaults.env の上にマージ (同名キーは tool 側が勝つ)
         env={**defaults.env, **_load_env(ctx, raw.get("env"))},
+        # annotations も env と同じくキー単位のマージ (「この server は全部 read-only」を
+        # defaults 1 箇所で宣言し、例外の tool だけ上書きできる)
+        annotations={
+            **defaults.annotations,
+            **_load_annotations(ctx, raw.get("annotations")),
+        },
     )
 
     referenced: set[str] = set()
@@ -228,10 +264,14 @@ def _load_defaults(raw: Any) -> Defaults:
         raise ConfigError("'defaults' must be a mapping")
     unknown = set(raw) - {
         "output_mode", "inline_max_output_bytes", "inline_on_large_output",
-        "file_output_dir", "env",
+        "file_output_dir", "env", "annotations",
     }
     if unknown:
         raise ConfigError(f"defaults: unknown keys {sorted(unknown)}")
+    annotations = _load_annotations("defaults", raw.get("annotations"))
+    if "title" in annotations:
+        # title は 1 ツールの表示名。server 全体に配ると全ツールが同じ表示名になる
+        raise ConfigError("defaults: annotations.title is per-tool only")
     defaults = Defaults(
         output_mode=raw.get("output_mode", "inline"),
         inline_max_output_bytes=raw.get(
@@ -240,6 +280,7 @@ def _load_defaults(raw: Any) -> Defaults:
         inline_on_large_output=raw.get("inline_on_large_output", "truncate"),
         file_output_dir=_load_file_output_dir("defaults", raw.get("file_output_dir")),
         env=_load_env("defaults", raw.get("env")),
+        annotations=annotations,
     )
     _check_choice("defaults", "output_mode", defaults.output_mode, OUTPUT_MODES)
     _check_choice(

@@ -19,6 +19,15 @@ from cli_wrap_mcp.spec import (
 )
 
 
+# job 補助ツールの annotations はエンジンが固定する (config の宣言は _start だけに効く)。
+# 状態を読むだけの _status / _result は read-only、プロセスを止める _cancel はそうではない
+JOB_AUX_ANNOTATIONS: dict[str, dict[str, Any]] = {
+    "status": {"readOnlyHint": True},
+    "result": {"readOnlyHint": True},
+    "cancel": {"readOnlyHint": False},
+}
+
+
 def default_cache_dir() -> Path:
     """出力ルート未指定時の既定 cache dir (CLI_MCP_CACHE_DIR で上書き可) を返す。"""
     env = os.environ.get("CLI_MCP_CACHE_DIR")
@@ -54,6 +63,15 @@ def _make_tool_fn(fn_name: str, tool: ToolSpec, invoke, inject_output_dir: bool 
     namespace: dict[str, Any] = {"_invoke": invoke}
     exec(src, namespace)  # noqa: S102 - config は信頼済みローカルファイル
     return namespace[fn_name]
+
+
+def _annotations(values: dict[str, Any]):
+    """検証済みの annotations 宣言を MCP の ToolAnnotations にする (空なら None)。"""
+    if not values:
+        return None
+    from mcp.types import ToolAnnotations
+
+    return ToolAnnotations(**values)
 
 
 def build_server(spec: ServerSpec, cache_dir: Path | None = None):
@@ -104,7 +122,10 @@ def register_tool(
             "the full output is always written under it (regardless of size or exit "
             "code) and only the file path + excerpts are returned"
         )
-        mcp.add_tool(fn, name=tool.name, description=description)
+        mcp.add_tool(
+            fn, name=tool.name, description=description,
+            annotations=_annotations(tool.annotations),
+        )
     elif tool.mode == "job":
         assert jobs is not None
         register_job_tool(mcp, tool, jobs)
@@ -170,9 +191,20 @@ def register_job_tool(mcp, tool: ToolSpec, jobs: JobManager) -> None:
             f"job tool handlers {sorted(handlers)} do not match "
             f"JOB_TOOL_SUFFIXES {sorted(JOB_TOOL_SUFFIXES)}"
         )
+    if set(JOB_AUX_ANNOTATIONS) != set(JOB_TOOL_SUFFIXES) - {"start"}:
+        raise ConfigError(
+            f"job aux annotations {sorted(JOB_AUX_ANNOTATIONS)} do not cover "
+            f"JOB_TOOL_SUFFIXES {sorted(JOB_TOOL_SUFFIXES)} except 'start'"
+        )
     for suffix in JOB_TOOL_SUFFIXES:
         fn, description = handlers[suffix]
-        mcp.add_tool(fn, name=f"{tool.name}_{suffix}", description=description)
+        mcp.add_tool(
+            fn, name=f"{tool.name}_{suffix}", description=description,
+            # 宣言が効くのは実際にコマンドを起動する _start だけ。補助 3 つは固定値
+            annotations=_annotations(
+                tool.annotations if suffix == "start" else JOB_AUX_ANNOTATIONS[suffix]
+            ),
+        )
 
 
 def _tool_description(tool: ToolSpec) -> str:
