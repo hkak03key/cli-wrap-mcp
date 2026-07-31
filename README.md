@@ -232,18 +232,20 @@ server restarts. See [`examples/sleep-job.yml`](examples/sleep-job.yml).
 
 **Feeding requests in from a pipe or a file loses the tail of the replies.** When
 stdin reaches EOF, the MCP Python SDK tears the session down without waiting for the
-requests it is still handling, so the last ones come back unanswered — their commands
-have already run (to completion, or until `timeout_sec` killed them); only the
+requests it is still handling, so the last ones come back unanswered — the commands
+themselves already ran, to completion or until `timeout_sec` killed them; only the
 responses are never written. A missing reply therefore never means the command was
-skipped, and re-running it repeats its side effects. Under `mode: job` the lost reply
-takes the `job_id` with it, leaving a live background job findable only under
-`<root>/jobs/`. How much of the tail goes missing depends on timing, so a batch that
-came back whole once is no guarantee for the next. Tracked upstream as
+skipped, and re-running it repeats its side effects. A `mode: job` command is worse
+off: it keeps running in the background and the lost reply takes its `job_id` with
+it, leaving it findable only under `<root>/jobs/`. How much of the tail goes missing
+depends on timing, so a batch that came back whole once is no guarantee for the next.
+Tracked upstream as
 [python-sdk#2678](https://github.com/modelcontextprotocol/python-sdk/issues/2678).
 
-Closing the server's stdout early (`… | head -1`) is a separate hazard, not covered
-by that upstream issue: the SDK dies on a `BrokenPipeError` partway through, so the
-remaining commands never run — and the ones that did run lose their replies too.
+Closing the server's stdout early is a separate hazard, not covered by that upstream
+issue: the SDK dies on a `BrokenPipeError`. Cut it as early as `… | head -1` and it
+dies before most of the commands run, taking the replies of the ones that did run
+with it.
 
 What keeps a caller clear of both is reading each reply before stdin closes,
 whatever the medium — pasting a batch into a terminal and pressing Ctrl-D drops
