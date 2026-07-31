@@ -55,7 +55,7 @@ class JobManager:
     def _job_dir(self, job_id: str) -> Path:
         """job_id を検証して job dir のパスを返す。"""
         # job_id は client 入力なので、パストラバーサルを形式検証で遮断する
-        if not INVOCATION_ID_RE.match(job_id):
+        if not INVOCATION_ID_RE.fullmatch(job_id):
             raise ParamValidationError(f"invalid job_id: {job_id!r}")
         return self.jobs_dir / job_id
 
