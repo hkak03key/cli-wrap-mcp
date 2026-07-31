@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Annotated, Any
 
+from mcp.server.fastmcp import FastMCP
 from mcp.types import CallToolResult, TextContent
 
 from cli_wrap_mcp.execution import run_sync
@@ -94,8 +95,6 @@ def _make_tool_fn(fn_name: str, tool: ToolSpec, invoke, inject_output_dir: bool 
 
 def build_server(spec: ServerSpec, cache_dir: Path | None = None):
     """ServerSpec の全ツールを登録した FastMCP サーバーを返す。"""
-    from mcp.server.fastmcp import FastMCP
-
     mcp = FastMCP(spec.name, instructions=spec.description)
     server_cache_dir = (cache_dir or default_cache_dir()) / spec.name
     # 出力ルートは tool の file_output_dir (未指定は cache)。sync は <root>/outputs/、
