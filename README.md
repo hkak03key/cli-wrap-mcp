@@ -138,6 +138,7 @@ Top level:
 | `defaults.inline_on_large_output` | no | Default overflow behavior for all tools: `truncate` (default) or `file`. |
 | `defaults.file_output_dir` | no | Default output root for all tools (absolute path; see per-tool `file_output_dir`). |
 | `defaults.env` | no | Environment variables forced for every tool (mapping of `VAR_NAME` → string; quote numbers). Merged over the inherited environment at execution time, so config values always win. |
+| `defaults.annotations` | no | MCP tool annotations applied to every tool (see per-tool `annotations`). Merged key by key with the tool's own; `title` is per-tool only and rejected here. |
 | `tools` | yes | List of tool definitions (at least one). |
 
 Per tool:
@@ -155,6 +156,7 @@ Per tool:
 | `file_output_dir` | no | inherits `defaults` (cache dir) | Output root for this tool (absolute path). File outputs go to `<root>/outputs/`, job state to `<root>/jobs/`, so all traces of a tool accumulate under one configured location. |
 | `params` | no | `{}` | Mapping of parameter name → spec. |
 | `env` | no | `{}` | Environment variables forced for this tool. Merged over `defaults.env` (tool wins), then over the inherited environment at execution time. |
+| `annotations` | no | `{}` | MCP tool annotations served in `tools/list` (`title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`). Merged over `defaults.annotations` (tool wins). See below. |
 
 Per parameter (`params.<name>`):
 
@@ -192,6 +194,48 @@ optional absolute-path parameter; when set, the full output is always written un
 that directory — regardless of size, exit code, or the tool's `output_mode` — and
 only the file path plus excerpts are returned. It overrides the config-level
 `file_output_dir` for that call.
+
+### Tool annotations
+
+`annotations` declares the [MCP tool annotations](https://modelcontextprotocol.io/specification/2025-06-18/server/tools#tool-annotations)
+served with the tool, so a client can tell a read-only tool from one that mutates
+state without knowing anything about the wrapped CLI:
+
+```yaml
+defaults:
+  # "everything in this server is read-only", declared once and actually served
+  annotations:
+    readOnlyHint: true
+
+tools:
+  - name: csv_select
+    argv: ["csvcut", "-c", "{columns}", "{path}"]
+    # inherits readOnlyHint: true
+
+  - name: replace_apply
+    argv: ["sed", "-i", "{expr}", "{path}"]
+    annotations:
+      title: Rewrite a file in place
+      readOnlyHint: false
+      destructiveHint: true
+      idempotentHint: false
+```
+
+The five keys above are the whole set the MCP spec defines; anything else (including
+a case typo like `readonlyHint`) is a load-time error, and each value is type-checked
+(`title` is a string, the four hints are booleans). Values are otherwise passed
+through untouched — the engine never derives them from `argv`.
+
+These are **hints, not guarantees**: nothing in the engine enforces that a tool
+declared `readOnlyHint: true` cannot write. They are as trustworthy as the config
+they come from — which, per the trust model above, is your own local file. Clients
+can use them for blanket policies such as "auto-approve read-only tools, always
+prompt for destructive ones".
+
+In `mode: job`, the declaration applies to `<name>_start` (the tool that actually
+runs the command). The three helper tools are fixed by the engine and do not inherit
+it: `_status` and `_result` get `readOnlyHint: true`, `_cancel` gets
+`readOnlyHint: false`.
 
 ### File output layout
 
