@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from cli_wrap_mcp.runtime import exec_env, new_invocation_id
-from cli_wrap_mcp.spec import FILE_EXCERPT_BYTES, STDERR_TAIL_BYTES, ToolSpec
+from cli_wrap_mcp.spec import FILE_EXCERPT_BYTES, STDERR_TAIL_BYTES, ToolReply, ToolSpec
 
 
 def _truncate(data: bytes, limit: int) -> str:
@@ -91,8 +91,12 @@ def run_sync(
     argv: list[str],
     file_dir: Path | None = None,
     call_dir: Path | None = None,
-) -> str:
-    """コマンドを同期実行し、出力の返し方 (inline / truncate / file) を解決した応答を返す。"""
+) -> ToolReply:
+    """コマンドを同期実行し、出力の返し方 (inline / truncate / file) を解決した応答を返す。
+
+    ラップ先が非ゼロ終了・timeout・起動失敗のいずれかなら is_error を立てる
+    (証跡の書き出し失敗も、応答が要求どおり返せていないので失敗として扱う)。
+    """
     started_at = datetime.now(timezone.utc).isoformat()
     # per-call 指定 (call_dir = 予約 param file_output_dir) または file mode では、
     # 成否・サイズに関係なく常に全量をファイル化する (証跡: 失敗した実行も記録に残す)
@@ -119,26 +123,30 @@ def run_sync(
                 msg += f"\npartial output saved to: {inv_dir}"
             except OSError as write_exc:
                 msg += f"\n(failed to save partial output: {write_exc})"
-        return msg
+        return ToolReply(msg, is_error=True)
     except OSError as exc:
-        return f"error: failed to execute {argv!r}: {exc}"
+        return ToolReply(f"error: failed to execute {argv!r}: {exc}", is_error=True)
     if dest is not None:
         meta = _invocation_meta(tool, argv, started_at, proc.returncode)
         try:
             inv_dir = _write_invocation_dir(tool, dest, proc.stdout, proc.stderr, meta)
         except OSError as exc:
-            return f"error: failed to write output to {dest}: {exc}"
+            return ToolReply(
+                f"error: failed to write output to {dest}: {exc}", is_error=True,
+            )
         if proc.returncode != 0:
-            return (
+            return ToolReply(
                 f"error: command exited with code {proc.returncode}\n"
                 f"output saved to: {inv_dir}\n"
-                f"stderr (tail):\n{_stderr_tail(proc.stderr)}"
+                f"stderr (tail):\n{_stderr_tail(proc.stderr)}",
+                is_error=True,
             )
-        return _file_reply(proc.stdout, inv_dir)
+        return ToolReply(_file_reply(proc.stdout, inv_dir))
     if proc.returncode != 0:
-        return (
+        return ToolReply(
             f"error: command exited with code {proc.returncode}\n"
-            f"stderr (tail):\n{_stderr_tail(proc.stderr)}"
+            f"stderr (tail):\n{_stderr_tail(proc.stderr)}",
+            is_error=True,
         )
     if (
         len(proc.stdout) > tool.inline_max_output_bytes
@@ -153,8 +161,8 @@ def run_sync(
                 f"cliwrap: file output failed ({exc}); falling back to truncate",
                 file=sys.stderr,
             )
-            return _truncate(proc.stdout, tool.inline_max_output_bytes)
-        return _file_reply(
-            proc.stdout, inv_dir, reason=f" (> {tool.inline_max_output_bytes})",
+            return ToolReply(_truncate(proc.stdout, tool.inline_max_output_bytes))
+        return ToolReply(
+            _file_reply(proc.stdout, inv_dir, reason=f" (> {tool.inline_max_output_bytes})"),
         )
-    return _truncate(proc.stdout, tool.inline_max_output_bytes)
+    return ToolReply(_truncate(proc.stdout, tool.inline_max_output_bytes))

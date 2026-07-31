@@ -41,32 +41,32 @@ class JobModeTest(unittest.TestCase):
     def test_start_status_result_lifecycle(self):
         msg = self.jobs.start(
             self.tool, [sys.executable, "-c", "print('job-out'); import sys; sys.exit(0)"],
-        )
+        ).text
         job_id = self.job_id_from(msg)
         state, rc = self.wait_exit(job_id)
         self.assertEqual(("exited", 0), (state, rc))
-        status = self.jobs.status(job_id)
+        status = self.jobs.status(job_id).text
         self.assertIn("exited", status)
         self.assertIn("job-out", status)
-        result = self.jobs.result(job_id, self.tool.inline_max_output_bytes)
+        result = self.jobs.result(job_id, self.tool.inline_max_output_bytes).text
         self.assertIn("job-out", result)
         jdir = self.jobs.jobs_dir / job_id
         for name in ("stdout.log", "stderr.log", "pid", "meta.json", "exit_code"):
             self.assertTrue((jdir / name).exists(), name)
 
     def test_result_while_running_says_running(self):
-        msg = self.jobs.start(self.tool, [sys.executable, "-c", "import time; time.sleep(30)"])
+        msg = self.jobs.start(self.tool, [sys.executable, "-c", "import time; time.sleep(30)"]).text
         job_id = self.job_id_from(msg)
         try:
-            self.assertIn("still running", self.jobs.result(job_id, 1000))
-            self.assertIn("running", self.jobs.status(job_id))
+            self.assertIn("still running", self.jobs.result(job_id, 1000).text)
+            self.assertIn("running", self.jobs.status(job_id).text)
         finally:
             self.jobs.cancel(job_id)
 
     def test_cancel_terminates_job(self):
-        msg = self.jobs.start(self.tool, [sys.executable, "-c", "import time; time.sleep(30)"])
+        msg = self.jobs.start(self.tool, [sys.executable, "-c", "import time; time.sleep(30)"]).text
         job_id = self.job_id_from(msg)
-        out = self.jobs.cancel(job_id)
+        out = self.jobs.cancel(job_id).text
         self.assertIn("SIGTERM", out)
         state, rc = self.wait_exit(job_id)
         self.assertEqual("exited", state)
@@ -76,10 +76,10 @@ class JobModeTest(unittest.TestCase):
         msg = self.jobs.start(
             self.tool,
             [sys.executable, "-c", "import sys; sys.stderr.write('job-err'); sys.exit(2)"],
-        )
+        ).text
         job_id = self.job_id_from(msg)
         self.wait_exit(job_id)
-        result = self.jobs.result(job_id, 1000)
+        result = self.jobs.result(job_id, 1000).text
         self.assertIn("exit code 2", result)
         self.assertIn("job-err", result)
 

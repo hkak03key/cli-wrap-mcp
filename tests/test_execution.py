@@ -18,13 +18,13 @@ class RunSyncTest(unittest.TestCase):
 
     def test_stdout_returned(self):
         tool = self.tool([sys.executable, "-c", "print('hello')"])
-        self.assertEqual("hello\n", run_sync(tool, tool.argv))
+        self.assertEqual("hello\n", run_sync(tool, tool.argv).text)
 
     def test_output_truncated_with_note(self):
         tool = self.tool(
             [sys.executable, "-c", "print('x' * 1000)"], inline_max_output_bytes=100,
         )
-        out = run_sync(tool, tool.argv)
+        out = run_sync(tool, tool.argv).text
         self.assertIn("output truncated at 100 bytes", out)
         self.assertLess(len(out), 300)
 
@@ -32,7 +32,7 @@ class RunSyncTest(unittest.TestCase):
         tool = self.tool(
             [sys.executable, "-c", "import sys; sys.stderr.write('boom'); sys.exit(3)"],
         )
-        out = run_sync(tool, tool.argv)
+        out = run_sync(tool, tool.argv).text
         self.assertIn("exited with code 3", out)
         self.assertIn("boom", out)
 
@@ -40,12 +40,12 @@ class RunSyncTest(unittest.TestCase):
         tool = self.tool(
             [sys.executable, "-c", "import time; time.sleep(5)"], timeout_sec=1,
         )
-        out = run_sync(tool, tool.argv)
+        out = run_sync(tool, tool.argv).text
         self.assertIn("timed out after 1s", out)
 
     def test_missing_binary_returns_error(self):
         tool = self.tool(["/nonexistent/binary"])
-        out = run_sync(tool, tool.argv)
+        out = run_sync(tool, tool.argv).text
         self.assertIn("failed to execute", out)
 
 class FileOutputModeTest(unittest.TestCase):
@@ -68,7 +68,7 @@ class FileOutputModeTest(unittest.TestCase):
 
     def test_file_mode_writes_file_holding_full_output(self):
         tool = self.tool()
-        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir).text
         self.assertIn("full output saved to file", out)
         self.assertIn("1001 bytes", out)  # 総バイト数 (1000 + 改行)
         self.assertIn("offset/limit", out)
@@ -91,7 +91,7 @@ class FileOutputModeTest(unittest.TestCase):
     def test_file_mode_writes_even_small_output(self):
         # file mode は証跡目的なので、上限以下でも常にファイル化する
         tool = self.tool(inline_max_output_bytes=5000)
-        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir).text
         self.assertIn("full output saved to file", out)
         self.assertEqual(1, len(list(self.file_dir.iterdir())))
 
@@ -100,7 +100,7 @@ class FileOutputModeTest(unittest.TestCase):
             argv=[sys.executable, "-c",
                   "import sys; print('partial'); sys.stderr.write('boom'); sys.exit(3)"],
         )
-        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir).text
         self.assertIn("exited with code 3", out)
         self.assertIn("output saved to:", out)
         self.assertIn("boom", out)
@@ -118,7 +118,7 @@ class FileOutputModeTest(unittest.TestCase):
             argv=[sys.executable, "-u", "-c",
                   "import time; print('before-sleep'); time.sleep(5)"],
         )
-        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir).text
         self.assertIn("timed out after 1s", out)
         self.assertIn("partial output saved to:", out)
         dirs = list(self.file_dir.iterdir())
@@ -132,13 +132,13 @@ class FileOutputModeTest(unittest.TestCase):
 
     def test_inline_truncate_never_writes_file(self):
         tool = self.tool(output_mode="inline")
-        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir).text
         self.assertIn("output truncated at 100 bytes", out)
         self.assertFalse(self.file_dir.exists())
 
     def test_inline_on_large_output_file_writes_only_on_overflow(self):
         tool = self.tool(output_mode="inline", inline_on_large_output="file")
-        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir).text
         self.assertIn("full output saved to file", out)  # 超過 → ファイル化 (旧 spill)
         self.assertEqual(1, len(list(self.file_dir.iterdir())))
 
@@ -147,14 +147,73 @@ class FileOutputModeTest(unittest.TestCase):
             output_mode="inline", inline_on_large_output="file",
             inline_max_output_bytes=5000,
         )
-        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir).text
         self.assertEqual("x" * 1000 + "\n", out)
         self.assertFalse(self.file_dir.exists())
 
     def test_file_mode_without_dir_falls_back_to_truncate(self):
         tool = self.tool()
-        out = run_sync(tool, tool.argv, file_dir=None)
+        out = run_sync(tool, tool.argv, file_dir=None).text
         self.assertIn("output truncated at 100 bytes", out)
+
+class ErrorFlagTest(unittest.TestCase):
+    """ラップ先の失敗が is_error に出ること (本文の文字列照合に頼らせない)。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.file_dir = Path(self._tmp.name) / "outputs"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def tool(self, argv, **kwargs) -> ToolSpec:
+        return ToolSpec(name="t", description="", argv=argv, **kwargs)
+
+    def test_success_is_not_error(self):
+        tool = self.tool([sys.executable, "-c", "print('ok')"])
+        self.assertFalse(run_sync(tool, tool.argv).is_error)
+
+    def test_exit_zero_printing_error_prefix_is_not_error(self):
+        # 本文が "error:" で始まっても exit 0 なら成功 (issue #5 の誤検出シナリオ)
+        tool = self.tool([sys.executable, "-c", "print('error: looks scary')"])
+        reply = run_sync(tool, tool.argv)
+        self.assertTrue(reply.text.startswith("error:"))
+        self.assertFalse(reply.is_error)
+
+    def test_nonzero_exit_is_error(self):
+        tool = self.tool([sys.executable, "-c", "import sys; sys.exit(3)"])
+        self.assertTrue(run_sync(tool, tool.argv).is_error)
+
+    def test_exit_one_is_error(self):
+        # 境界: 非ゼロの最小値でも立つ (ガードレールの exit 1 が主な用途)
+        tool = self.tool([sys.executable, "-c", "import sys; sys.exit(1)"])
+        self.assertTrue(run_sync(tool, tool.argv).is_error)
+
+    def test_timeout_is_error(self):
+        tool = self.tool([sys.executable, "-c", "import time; time.sleep(5)"], timeout_sec=1)
+        self.assertTrue(run_sync(tool, tool.argv).is_error)
+
+    def test_missing_binary_is_error(self):
+        self.assertTrue(run_sync(self.tool(["/nonexistent/binary"]), ["/nonexistent/binary"]).is_error)
+
+    def test_file_mode_nonzero_exit_is_error(self):
+        tool = self.tool(
+            [sys.executable, "-c", "import sys; sys.exit(3)"], output_mode="file",
+        )
+        self.assertTrue(run_sync(tool, tool.argv, file_dir=self.file_dir).is_error)
+
+    def test_file_mode_success_is_not_error(self):
+        tool = self.tool([sys.executable, "-c", "print('ok')"], output_mode="file")
+        self.assertFalse(run_sync(tool, tool.argv, file_dir=self.file_dir).is_error)
+
+    def test_write_failure_is_error(self):
+        blocker = Path(self._tmp.name) / "blocker"
+        blocker.write_text("file")
+        tool = self.tool([sys.executable, "-c", "print('ok')"], output_mode="file")
+        reply = run_sync(tool, tool.argv, file_dir=blocker / "sub")
+        self.assertIn("failed to write output", reply.text)
+        self.assertTrue(reply.is_error)
+
 
 class EnvExecTest(unittest.TestCase):
     PRINT_VAR = "import os; print(os.environ.get('CLIWRAP_TEST_VAR', '(unset)'))"
@@ -166,7 +225,7 @@ class EnvExecTest(unittest.TestCase):
 
     def test_run_sync_forces_env_var(self):
         tool = self.tool({"CLIWRAP_TEST_VAR": "forced"})
-        self.assertEqual("forced\n", run_sync(tool, tool.argv))
+        self.assertEqual("forced\n", run_sync(tool, tool.argv).text)
 
     def test_forced_env_overrides_inherited(self):
         import os
@@ -174,7 +233,7 @@ class EnvExecTest(unittest.TestCase):
         os.environ["CLIWRAP_TEST_VAR"] = "parent"
         self.addCleanup(os.environ.pop, "CLIWRAP_TEST_VAR", None)
         tool = self.tool({"CLIWRAP_TEST_VAR": "forced"})
-        self.assertEqual("forced\n", run_sync(tool, tool.argv))
+        self.assertEqual("forced\n", run_sync(tool, tool.argv).text)
 
     def test_parent_env_still_inherited_alongside_forced(self):
         import os
@@ -186,7 +245,7 @@ class EnvExecTest(unittest.TestCase):
             argv=[sys.executable, "-c", "import os; print(os.environ['CLIWRAP_OTHER_VAR'])"],
             env={"CLIWRAP_TEST_VAR": "forced"},
         )
-        self.assertEqual("inherited\n", run_sync(tool, tool.argv))
+        self.assertEqual("inherited\n", run_sync(tool, tool.argv).text)
 
     def test_no_env_config_inherits_parent(self):
         import os
@@ -194,7 +253,7 @@ class EnvExecTest(unittest.TestCase):
         os.environ["CLIWRAP_TEST_VAR"] = "parent"
         self.addCleanup(os.environ.pop, "CLIWRAP_TEST_VAR", None)
         tool = self.tool({})
-        self.assertEqual("parent\n", run_sync(tool, tool.argv))
+        self.assertEqual("parent\n", run_sync(tool, tool.argv).text)
 
     def test_job_start_forces_env_var(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -203,7 +262,7 @@ class EnvExecTest(unittest.TestCase):
                 name="j", description="", argv=[], mode="job",
                 env={"CLIWRAP_TEST_VAR": "forced"},
             )
-            msg = jobs.start(tool, [sys.executable, "-c", self.PRINT_VAR])
+            msg = jobs.start(tool, [sys.executable, "-c", self.PRINT_VAR]).text
             job_id = msg.splitlines()[0].removeprefix("job started: ")
             import time
 
