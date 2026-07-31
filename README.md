@@ -92,6 +92,9 @@ Try the bundled examples:
 uvx cli-wrap-mcp@0.2.1 --config examples/echo.yml
 ```
 
+The server speaks MCP on stdio, so drive it from a client rather than a shell pipe
+(see [Known limitations](#known-limitations)).
+
 [`examples/gcloud.yml`](examples/gcloud.yml) shows the "arbitrary subcommand with
 forced env vars and options" pattern (variadic `array` param + `deny_pattern` +
 `env` forcing).
@@ -227,19 +230,23 @@ server restarts. See [`examples/sleep-job.yml`](examples/sleep-job.yml).
 
 ## Known limitations
 
-**A shell pipe can lose the tail of the replies.** Piping a batch of requests into the
-server can leave the last ones unanswered: when stdin reaches EOF, the MCP Python SDK
-tears the session down without waiting for the requests it is still handling, so
-those commands run but their responses are never written — and how many go missing
-is a race, so a missing reply never means the command was skipped. Closing the read
-end early instead (`… | head -1`) trips the same teardown from the other side, as a
-`BrokenPipeError` traceback out of the SDK. Clients that keep the session open
-until each reply arrives do not hit this, which makes it a hazard of driving the
-server by hand rather than of normal use — to try a config out interactively, use a
-client that waits for each reply. Tracked upstream as
-[python-sdk#2678](https://github.com/modelcontextprotocol/python-sdk/issues/2678);
-[issue #7](https://github.com/hkak03key/cli-wrap-mcp/issues/7) carries the
-reproduction and the analysis.
+**Feeding requests in from a pipe loses the tail of the replies.** With a shell pipe
+or a file redirect on stdin, the last requests come back unanswered: on EOF the MCP
+Python SDK tears the session down without waiting for the ones it is still handling,
+so those commands run to completion but their responses are never written. A missing
+reply therefore never means the command was skipped — re-running it repeats its side
+effects. How much of the tail is lost depends on timing, so a batch that came back
+whole once is no guarantee for the next. Tracked upstream as
+[python-sdk#2678](https://github.com/modelcontextprotocol/python-sdk/issues/2678).
+
+Closing the server's stdout early (`… | head -1`) is a separate shell hazard, not
+covered by that upstream issue: the SDK dies on a `BrokenPipeError` partway through,
+so the remaining commands never run at all.
+
+Neither bites a client that keeps the session open until each reply arrives, nor a
+terminal you type into (stdin never reaches EOF there). To try a config out by hand,
+use one of those rather than a pipe. [Issue #7](https://github.com/hkak03key/cli-wrap-mcp/issues/7)
+records how both show up here.
 
 ## Development
 
