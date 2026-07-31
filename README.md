@@ -227,14 +227,19 @@ server restarts. See [`examples/sleep-job.yml`](examples/sleep-job.yml).
 
 ## Known limitations
 
-**A shell pipe loses the tail of the replies.** Piping a batch of requests into the
-server can leave the last ones unanswered: when stdin reaches EOF, the MCP Python
-SDK tears the session down without waiting for the requests it is still handling,
-so the command runs but its response is never written. Clients that read each reply
-before closing stdin do not hit this, so it only affects probing by hand from a
-shell — to try a config out interactively, drive the server from a waiting client.
-[Issue #7](https://github.com/hkak03key/cli-wrap-mcp/issues/7) carries the
-reproduction and the upstream status.
+**A shell pipe can lose the tail of the replies.** Piping a batch of requests into the
+server can leave the last ones unanswered: when stdin reaches EOF, the MCP Python SDK
+tears the session down without waiting for the requests it is still handling, so
+those commands run but their responses are never written — and how many go missing
+is a race, so a missing reply never means the command was skipped. Closing the read
+end early instead (`… | head -1`) trips the same teardown from the other side, as a
+`BrokenPipeError` traceback out of the SDK. Clients that keep the session open
+until each reply arrives do not hit this, which makes it a hazard of driving the
+server by hand rather than of normal use — to try a config out interactively, use a
+client that waits for each reply. Tracked upstream as
+[python-sdk#2678](https://github.com/modelcontextprotocol/python-sdk/issues/2678);
+[issue #7](https://github.com/hkak03key/cli-wrap-mcp/issues/7) carries the
+reproduction and the analysis.
 
 ## Development
 
