@@ -92,8 +92,8 @@ Try the bundled examples:
 uvx cli-wrap-mcp@0.2.1 --config examples/echo.yml
 ```
 
-The server speaks MCP on stdio, so drive it from a client rather than a shell pipe
-(see [Known limitations](#known-limitations)).
+The server speaks MCP on stdio, so drive it from a client rather than a pipe or a
+file redirect (see [Known limitations](#known-limitations)).
 
 [`examples/gcloud.yml`](examples/gcloud.yml) shows the "arbitrary subcommand with
 forced env vars and options" pattern (variadic `array` param + `deny_pattern` +
@@ -230,22 +230,25 @@ server restarts. See [`examples/sleep-job.yml`](examples/sleep-job.yml).
 
 ## Known limitations
 
-**Feeding requests in from a pipe loses the tail of the replies.** With a shell pipe
-or a file redirect on stdin, the last requests come back unanswered: on EOF the MCP
-Python SDK tears the session down without waiting for the ones it is still handling,
-so those commands run to completion but their responses are never written. A missing
-reply therefore never means the command was skipped — re-running it repeats its side
-effects. How much of the tail is lost depends on timing, so a batch that came back
-whole once is no guarantee for the next. Tracked upstream as
+**Feeding requests in from a pipe or a file loses the tail of the replies.** When
+stdin reaches EOF, the MCP Python SDK tears the session down without waiting for the
+requests it is still handling, so the last ones come back unanswered — their commands
+have already run (to completion, or until `timeout_sec` killed them); only the
+responses are never written. A missing reply therefore never means the command was
+skipped, and re-running it repeats its side effects. Under `mode: job` the lost reply
+takes the `job_id` with it, leaving a live background job findable only under
+`<root>/jobs/`. How much of the tail goes missing depends on timing, so a batch that
+came back whole once is no guarantee for the next. Tracked upstream as
 [python-sdk#2678](https://github.com/modelcontextprotocol/python-sdk/issues/2678).
 
-Closing the server's stdout early (`… | head -1`) is a separate shell hazard, not
-covered by that upstream issue: the SDK dies on a `BrokenPipeError` partway through,
-so the remaining commands never run at all.
+Closing the server's stdout early (`… | head -1`) is a separate hazard, not covered
+by that upstream issue: the SDK dies on a `BrokenPipeError` partway through, so the
+remaining commands never run — and the ones that did run lose their replies too.
 
-Neither bites a client that keeps the session open until each reply arrives, nor a
-terminal you type into (stdin never reaches EOF there). To try a config out by hand,
-use one of those rather than a pipe. [Issue #7](https://github.com/hkak03key/cli-wrap-mcp/issues/7)
+What keeps a caller clear of both is reading each reply before stdin closes,
+whatever the medium — pasting a batch into a terminal and pressing Ctrl-D drops
+replies just like a pipe does. To try a config out by hand, drive the server from a
+client that waits. [Issue #7](https://github.com/hkak03key/cli-wrap-mcp/issues/7)
 records how both show up here.
 
 ## Development
