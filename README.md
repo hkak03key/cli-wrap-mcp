@@ -54,7 +54,7 @@ Safety is the core of this engine, enforced at execution and load time:
   logging goes to stderr.
 - **Bounded output.** Inline tool output is truncated at `inline_max_output_bytes`
   by default; `inline_on_large_output: file` diverts oversized output to a file
-  (path plus head/tail excerpts), and `output_mode: file` always writes the full
+  (path plus excerpts), and `output_mode: file` always writes the full
   output to a file — success or failure — for audit-trail use. Callers can also
   pass the auto-injected `file_output_dir` parameter to force the full output into
   a directory of their choosing.
@@ -149,7 +149,7 @@ Per tool:
 | `argv` | yes | — | Non-empty list of strings. `{param}` placeholders are substituted after validation; each element stays a single argv entry. |
 | `mode` | no | `sync` | `sync` (run and return) or `job` (background, see below). |
 | `timeout_sec` | no | `60` | Sync-mode timeout. |
-| `output_mode` | no | inherits `defaults` (`inline`) | `inline`: output is returned in the reply, subject to `inline_max_output_bytes`. `file`: output is **always** written to a file in full — success or failure, any size — and the reply carries the path plus head/tail excerpts (audit trail). |
+| `output_mode` | no | inherits `defaults` (`inline`) | `inline`: output is returned in the reply, subject to `inline_max_output_bytes`. `file`: output is **always** written to a file in full — success or failure, any size — and the reply carries the path plus excerpts (audit trail): head and tail of 1000 bytes each, or the output itself once when it is short enough to fit in one excerpt. |
 | `inline_max_output_bytes` | no | inherits `defaults` (`50000`) | Inline size limit (`output_mode: inline` only; also caps job `_result` tails). |
 | `inline_on_large_output` | no | inherits `defaults` (`truncate`) | What happens when inline output exceeds the limit: `truncate` (excess is lost) or `file` (full output goes to a file, reply carries path plus excerpts). |
 | `file_output_dir` | no | inherits `defaults` (cache dir) | Output root for this tool (absolute path). File outputs go to `<root>/outputs/`, job state to `<root>/jobs/`, so all traces of a tool accumulate under one configured location. |

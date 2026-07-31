@@ -88,6 +88,56 @@ class FileOutputModeTest(unittest.TestCase):
         self.assertEqual(0, meta["exit_code"])
         self.assertIn("started_at", meta)
 
+    def numbered_output_tool(self, lines: int) -> ToolSpec:
+        """1 行 5 バイト (連番 + 改行) の出力を lines 行だけ出す file mode tool。
+
+        全行が相異なるので、抜粋が重複しているかを内容で判定できる。
+        """
+        return self.tool(
+            argv=[sys.executable, "-c",
+                  f'import sys; sys.stdout.write("".join(f"{{i:04d}}\\n" '
+                  f"for i in range({lines})))"],
+        )
+
+    def excerpts(self, out: str) -> tuple[str, str]:
+        """file reply から head / tail 抜粋の本文を取り出す。"""
+        head_section = out.split("--- head (", 1)[1]
+        head = head_section.split(" bytes) ---\n", 1)[1].split("\n--- tail (", 1)[0]
+        tail_section = out.split("\n--- tail (", 1)[1]
+        return head, tail_section.split(" bytes) ---\n", 1)[1]
+
+    def test_file_mode_small_output_is_not_repeated(self):
+        # 全量が FILE_EXCERPT_BYTES 以下: head と tail に分けず本文を一度だけ返す
+        tool = self.numbered_output_tool(100)  # 500 bytes
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        body = "".join(f"{i:04d}\n" for i in range(100))
+        self.assertIn("500 bytes", out)
+        self.assertNotIn("--- head (", out)
+        self.assertNotIn("--- tail (", out)
+        self.assertIn("full output saved to file", out)
+        self.assertTrue(out.endswith(body))
+        self.assertEqual(1, out.count("0000\n"))  # 先頭行が二度現れない
+        # 応答が全量を含むので「全部読むな」の助言は不要
+        self.assertNotIn("Do not read it whole", out)
+
+    def test_file_mode_excerpts_do_not_overlap(self):
+        # FILE_EXCERPT_BYTES 超 2 倍以下: tail を head の続きから始めて重複を消す
+        tool = self.numbered_output_tool(300)  # 1500 bytes
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        head, tail = self.excerpts(out)
+        self.assertIn("--- head (1000 bytes) ---", out)
+        self.assertIn("--- tail (500 bytes) ---", out)
+        self.assertEqual("".join(f"{i:04d}\n" for i in range(300)), head + tail)
+
+    def test_file_mode_large_output_keeps_head_and_tail(self):
+        # 2 倍超: 従来どおり先頭と末尾を FILE_EXCERPT_BYTES ずつ抜粋する
+        tool = self.numbered_output_tool(600)  # 3000 bytes
+        out = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        head, tail = self.excerpts(out)
+        self.assertEqual("".join(f"{i:04d}\n" for i in range(200)), head)
+        self.assertEqual("".join(f"{i:04d}\n" for i in range(400, 600)), tail)
+        self.assertIn("Do not read it whole", out)
+
     def test_file_mode_writes_even_small_output(self):
         # file mode は証跡目的なので、上限以下でも常にファイル化する
         tool = self.tool(inline_max_output_bytes=5000)
