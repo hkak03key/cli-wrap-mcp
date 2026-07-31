@@ -225,6 +225,25 @@ Job logs and metadata persist under `<root>/jobs/` (the tool's `file_output_dir`
 or the cache dir), so finished jobs remain inspectable (best-effort) even across
 server restarts. See [`examples/sleep-job.yml`](examples/sleep-job.yml).
 
+## Error reporting
+
+Failures are reported with `isError: true` on the `CallToolResult`, so a client can
+branch on the protocol field instead of pattern-matching the response text. The text
+itself is unchanged — a wrapped CLI that legitimately prints `error: ...` on a
+successful run is still `isError: false`.
+
+`isError: true` is set when:
+
+- the wrapped command exits non-zero, times out, or cannot be started
+- a parameter fails validation, or `file_output_dir` is not an absolute path
+- writing the audit trail (`output_mode: file` or `file_output_dir`) fails
+- `<name>_result` is fetched for a job that exited non-zero, or whose exit code
+  could not be determined
+
+`<name>_status`, `<name>_cancel`, and a `<name>_result` on a still-running job report
+their observation and stay `isError: false` — the query itself succeeded. A cancelled
+job's own `<name>_result` reports the signal exit code, and is therefore an error.
+
 ## Development
 
 ```sh
