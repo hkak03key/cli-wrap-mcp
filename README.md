@@ -54,10 +54,10 @@ Safety is the core of this engine, enforced at execution and load time:
   logging goes to stderr.
 - **Bounded output.** Inline tool output is truncated at `inline_max_output_bytes`
   by default; `inline_on_large_output: file` diverts oversized output to a file
-  (path plus head/tail excerpts), and `output_mode: file` always writes the full
-  output to a file — success or failure — for audit-trail use. Callers can also
-  pass the auto-injected `file_output_dir` parameter to force the full output into
-  a directory of their choosing.
+  (path plus excerpts), and `output_mode: file` always writes the full output to a
+  file — success or failure — for audit-trail use. Callers can also pass the
+  auto-injected `file_output_dir` parameter to force the full output into a
+  directory of their choosing.
 - **Job isolation.** Background job IDs are strictly format-checked, blocking path
   traversal through `job_id`.
 - **Guardrails, not a sandbox.** For "arbitrary subcommand" tools (an `array` param
@@ -149,7 +149,7 @@ Per tool:
 | `argv` | yes | — | Non-empty list of strings. `{param}` placeholders are substituted after validation; each element stays a single argv entry. |
 | `mode` | no | `sync` | `sync` (run and return) or `job` (background, see below). |
 | `timeout_sec` | no | `60` | Sync-mode timeout. |
-| `output_mode` | no | inherits `defaults` (`inline`) | `inline`: output is returned in the reply, subject to `inline_max_output_bytes`. `file`: output is **always** written to a file in full — success or failure, any size — and the reply carries the path plus head/tail excerpts (audit trail). |
+| `output_mode` | no | inherits `defaults` (`inline`) | `inline`: output is returned in the reply, subject to `inline_max_output_bytes`. `file`: output is **always** written to a file in full — success or failure, any size — and the reply carries the path plus excerpts (audit trail). The excerpt budget is 1000 bytes of head and 1000 bytes of tail: output within that budget is returned whole, and larger output is returned as the two ends with the number of omitted bytes noted between them. |
 | `inline_max_output_bytes` | no | inherits `defaults` (`50000`) | Inline size limit (`output_mode: inline` only; also caps job `_result` tails). |
 | `inline_on_large_output` | no | inherits `defaults` (`truncate`) | What happens when inline output exceeds the limit: `truncate` (excess is lost) or `file` (full output goes to a file, reply carries path plus excerpts). |
 | `file_output_dir` | no | inherits `defaults` (cache dir) | Output root for this tool (absolute path). File outputs go to `<root>/outputs/`, job state to `<root>/jobs/`, so all traces of a tool accumulate under one configured location. |
@@ -189,9 +189,9 @@ use it to pass a variable-length subcommand tail (`gcloud {args}`). Rules:
 Parameter names must match `[a-z_][a-z0-9_]*` and must not be Python keywords.
 `file_output_dir` is **reserved**: the engine injects it into every sync tool as an
 optional absolute-path parameter; when set, the full output is always written under
-that directory — regardless of size, exit code, or the tool's `output_mode` — and
-only the file path plus excerpts are returned. It overrides the config-level
-`file_output_dir` for that call.
+that directory — regardless of size, exit code, or the tool's `output_mode` — and the
+reply carries the file path plus excerpts, under the same excerpt budget as
+`output_mode: file`. It overrides the config-level `file_output_dir` for that call.
 
 ### File output layout
 

@@ -13,7 +13,7 @@ FILE_EXCERPT_BYTES = 1_000
 # - inline: 応答にそのまま含める。上限 (inline_max_output_bytes) 超過時の挙動は
 #           inline_on_large_output (truncate: 切り詰め / file: ファイルへ書き出し)
 # - file:   成否やサイズに関係なく常にファイルへ全量書き出し (証跡用途)、
-#           応答はパス + 抜粋のみ
+#           応答はパス + 抜粋 (抜粋の予算に収まるなら全量)
 OUTPUT_MODES = {"inline", "file"}
 INLINE_ON_LARGE_OUTPUT_MODES = {"truncate", "file"}
 SUPPORTED_MODES = {"sync", "job"}
