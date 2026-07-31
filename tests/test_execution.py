@@ -189,6 +189,23 @@ class ErrorFlagTest(unittest.TestCase):
         tool = self.tool([sys.executable, "-c", "import sys; sys.exit(1)"])
         self.assertTrue(run_sync(tool, tool.argv).is_error)
 
+    def test_killed_by_signal_is_error(self):
+        # 非ゼロ側のもう一方の境界: シグナル終了は returncode が負値になる。
+        # ここを取りこぼすと OOM kill / SIGSEGV を「成功・出力なし」として返す
+        tool = self.tool(
+            [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"],
+        )
+        reply = run_sync(tool, tool.argv)
+        self.assertIn("exited with code -9", reply.text)
+        self.assertTrue(reply.is_error)
+
+    def test_file_mode_killed_by_signal_is_error(self):
+        tool = self.tool(
+            [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"],
+            output_mode="file",
+        )
+        self.assertTrue(run_sync(tool, tool.argv, file_dir=self.file_dir).is_error)
+
     def test_timeout_is_error(self):
         tool = self.tool([sys.executable, "-c", "import time; time.sleep(5)"], timeout_sec=1)
         self.assertTrue(run_sync(tool, tool.argv).is_error)
@@ -213,6 +230,29 @@ class ErrorFlagTest(unittest.TestCase):
         reply = run_sync(tool, tool.argv, file_dir=blocker / "sub")
         self.assertIn("failed to write output", reply.text)
         self.assertTrue(reply.is_error)
+
+    def big(self, **kwargs) -> ToolSpec:
+        return self.tool(
+            [sys.executable, "-c", "print('x' * 1000)"],
+            inline_max_output_bytes=100,
+            inline_on_large_output="file",
+            **kwargs,
+        )
+
+    def test_inline_on_large_output_file_is_not_error(self):
+        tool = self.big()
+        reply = run_sync(tool, tool.argv, file_dir=self.file_dir)
+        self.assertIn("full output saved to file", reply.text)
+        self.assertFalse(reply.is_error)
+
+    def test_inline_on_large_output_write_failure_falls_back_without_error(self):
+        # 上限超過のファイル化は失敗しても truncate で応答できるので成功扱いのまま
+        blocker = Path(self._tmp.name) / "blocker"
+        blocker.write_text("file")
+        tool = self.big()
+        reply = run_sync(tool, tool.argv, file_dir=blocker / "sub")
+        self.assertIn("output truncated at 100 bytes", reply.text)
+        self.assertFalse(reply.is_error)
 
 
 class EnvExecTest(unittest.TestCase):
