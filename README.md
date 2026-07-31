@@ -76,20 +76,20 @@ as above. The wrapped CLI runs with your local privileges.
 Requires Python >= 3.11. With [uv](https://docs.astral.sh/uv/):
 
 ```sh
-uvx cli-wrap-mcp@0.1.0 --config /path/to/config.yml
+uvx cli-wrap-mcp@0.2.1 --config /path/to/config.yml
 ```
 
 Or straight from git (pin a tag, or a commit SHA for full immutability):
 
 ```sh
-uvx --from git+https://github.com/hkak03key/cli-wrap-mcp@v0.1.0 cli-wrap-mcp --config /path/to/config.yml
+uvx --from git+https://github.com/hkak03key/cli-wrap-mcp@v0.2.1 cli-wrap-mcp --config /path/to/config.yml
 uvx --from git+https://github.com/hkak03key/cli-wrap-mcp@<commit-sha> cli-wrap-mcp --config /path/to/config.yml
 ```
 
 Try the bundled examples:
 
 ```sh
-uvx cli-wrap-mcp@0.1.0 --config examples/echo.yml
+uvx cli-wrap-mcp@0.2.1 --config examples/echo.yml
 ```
 
 [`examples/gcloud.yml`](examples/gcloud.yml) shows the "arbitrary subcommand with
@@ -105,7 +105,7 @@ Project `.mcp.json`:
   "mcpServers": {
     "echo-demo": {
       "command": "uvx",
-      "args": ["cli-wrap-mcp@0.1.0", "--config", "./configs/echo.yml"]
+      "args": ["cli-wrap-mcp@0.2.1", "--config", "./configs/echo.yml"]
     }
   }
 }
@@ -119,7 +119,7 @@ From a Claude Code plugin, ship only your configs and reference them via
   "mcpServers": {
     "gh-explorer": {
       "command": "uvx",
-      "args": ["cli-wrap-mcp@0.1.0", "--config", "${CLAUDE_PLUGIN_ROOT}/configs/gh-explorer.yml"]
+      "args": ["cli-wrap-mcp@0.2.1", "--config", "${CLAUDE_PLUGIN_ROOT}/configs/gh-explorer.yml"]
     }
   }
 }
