@@ -204,7 +204,7 @@ class StructuredContentShapeTest(unittest.TestCase):
     """server.SCALAR_RESULT_KEY が SDK の包み方と一致していることの機械検査。
 
     CallToolResult を自前で組む以上この形も自前で再現しており、ズレると
-    outputSchema 検証に落ちる (server.call_result の docstring 参照)。
+    outputSchema 検証に落ちる (server._call_result の docstring 参照)。
     """
 
     def test_scalar_result_key_matches_sdk_wrapping(self):

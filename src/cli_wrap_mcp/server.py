@@ -4,7 +4,9 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
+
+from mcp.types import CallToolResult, TextContent
 
 from cli_wrap_mcp.execution import run_sync
 from cli_wrap_mcp.jobs import JobManager
@@ -19,11 +21,16 @@ from cli_wrap_mcp.spec import (
     ToolSpec,
 )
 
-# FastMCP が `-> str` のツール戻り値を structuredContent へ包むときのキー。
+# FastMCP が scalar 戻り値を structuredContent へ包むときのキー。
 # 応答を CallToolResult として自前で組む以上この形も自前で再現する必要があり
 # (ズレると outputSchema 検証に落ちて ToolError になる)、値の正はここ 1 箇所に置く。
 # 実際の SDK 挙動との一致は test_server.StructuredContentShapeTest が機械検査する
 SCALAR_RESULT_KEY = "result"
+
+# ツール関数の戻り値注釈。FastMCP は Annotated[CallToolResult, X] の X から
+# outputSchema を推論しつつ、CallToolResult はそのまま client へ通す。応答本文の型は
+# str なので推論元は str、実際に返すのは isError を載せた CallToolResult になる
+ToolFnReturn = Annotated[CallToolResult, str]
 
 
 def default_cache_dir() -> Path:
@@ -32,23 +39,21 @@ def default_cache_dir() -> Path:
     return Path(env) if env else Path.home() / ".cache" / "cli-mcp"
 
 
-def _call_result(reply: ToolReply):
+def _call_result(reply: ToolReply) -> CallToolResult:
     """ToolReply を MCP の CallToolResult に変換する (失敗は isError で伝える)。
 
     tool 関数が str を返すと SDK は必ず isError=false で包むため、失敗を伝える経路は
     CallToolResult を自前で返すことになる。応答本文・outputSchema・structuredContent は
     SDK に組ませたときと同一で、isError だけが成否を運ぶ。
     """
-    from mcp import types
-
-    return types.CallToolResult(
-        content=[types.TextContent(type="text", text=reply.text)],
+    return CallToolResult(
+        content=[TextContent(type="text", text=reply.text)],
         structuredContent={SCALAR_RESULT_KEY: reply.text},
         isError=reply.is_error,
     )
 
 
-def _reply_to_result(call):
+def _reply_to_result(call) -> CallToolResult:
     """ToolReply を返す呼び出しを実行し、パラメータ検証エラーも失敗応答へ畳んで返す。"""
     try:
         return _call_result(call())
@@ -62,9 +67,6 @@ def _make_tool_fn(fn_name: str, tool: ToolSpec, invoke, inject_output_dir: bool 
     FastMCP は関数シグネチャから inputSchema を作るため、exec で実シグネチャを持つ
     関数を組み立てる。パラメータ名は config ロード時に識別子として検証済み。
     inject_output_dir=True で予約パラメータ file_output_dir (optional) を注入する。
-
-    戻り値注釈 `-> str` は FastMCP の outputSchema 推論のためのもので、invoke が実際に
-    返すのは CallToolResult である (応答本文の型は str のまま。_call_result 参照)。
     """
     required_args: list[str] = []
     optional_args: list[str] = []
@@ -81,11 +83,11 @@ def _make_tool_fn(fn_name: str, tool: ToolSpec, invoke, inject_output_dir: bool 
         optional_args.append("file_output_dir: str | None = None")
     signature = ", ".join(required_args + optional_args)
     src = (
-        f"def {fn_name}({signature}) -> str:\n"
+        f"def {fn_name}({signature}) -> ToolFnReturn:\n"
         f"    kwargs = dict(locals())\n"
         f"    return _invoke(kwargs)\n"
     )
-    namespace: dict[str, Any] = {"_invoke": invoke}
+    namespace: dict[str, Any] = {"_invoke": invoke, "ToolFnReturn": ToolFnReturn}
     exec(src, namespace)  # noqa: S102 - config は信頼済みローカルファイル
     return namespace[fn_name]
 
@@ -117,8 +119,9 @@ def register_tool(
 ) -> None:
     """tool の mode に応じた MCP ツール (sync は 1 つ、job は 4 つ) を登録する。"""
     if tool.mode == "sync":
-        def invoke(arguments: dict[str, Any], _tool=tool):
+        def invoke(arguments: dict[str, Any], _tool=tool) -> CallToolResult:
             def run() -> ToolReply:
+                """予約 param を解決し argv を組み立てて同期実行する。"""
                 call_dir_arg = arguments.pop("file_output_dir", None)
                 call_dir: Path | None = None
                 if call_dir_arg is not None:
@@ -153,19 +156,21 @@ def register_tool(
 def register_job_tool(mcp, tool: ToolSpec, jobs: JobManager) -> None:
     """job モードのツール一式 (<name>_start/_status/_result/_cancel) を登録する。"""
 
-    def invoke_start(arguments: dict[str, Any], _tool=tool):
+    def invoke_start(arguments: dict[str, Any], _tool=tool) -> CallToolResult:
         return _reply_to_result(lambda: jobs.start(_tool, render_argv(_tool, arguments)))
 
     start_fn = _make_tool_fn(f"tool_{tool.name}_start", tool, invoke_start)
 
-    # job 系ハンドラの `-> str` も outputSchema 推論用 (実際の戻り値は CallToolResult)
-    def status_fn(job_id: str) -> str:
+    def status_fn(job_id: str) -> ToolFnReturn:
+        """job の状態を問い合わせる。"""
         return _reply_to_result(lambda: jobs.status(job_id))
 
-    def result_fn(job_id: str) -> str:
+    def result_fn(job_id: str) -> ToolFnReturn:
+        """終了した job の出力を取得する。"""
         return _reply_to_result(lambda: jobs.result(job_id, tool.inline_max_output_bytes))
 
-    def cancel_fn(job_id: str) -> str:
+    def cancel_fn(job_id: str) -> ToolFnReturn:
+        """実行中の job を停止する。"""
         return _reply_to_result(lambda: jobs.cancel(job_id))
 
     # 公開名は spec.JOB_TOOL_SUFFIXES から導出する (config のロード時衝突検査と同じ一覧)
