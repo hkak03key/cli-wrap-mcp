@@ -360,6 +360,117 @@ class EnvConfigTest(unittest.TestCase):
                 '  - {name: x, argv: ["true"]}\n'
             )
 
+class AnnotationsConfigTest(unittest.TestCase):
+    """`annotations:` (MCP tool annotations) のロード時検証。"""
+
+    def test_all_annotation_fields_load(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'tools:\n'
+            '  - name: x\n'
+            '    argv: ["true"]\n'
+            '    annotations:\n'
+            '      title: Nice Name\n'
+            '      readOnlyHint: false\n'
+            '      destructiveHint: true\n'
+            '      idempotentHint: false\n'
+            '      openWorldHint: true\n'
+        )
+        self.assertEqual(
+            {
+                "title": "Nice Name",
+                "readOnlyHint": False,
+                "destructiveHint": True,
+                "idempotentHint": False,
+                "openWorldHint": True,
+            },
+            spec.tools["x"].annotations,
+        )
+
+    def test_absent_annotations_is_empty(self):
+        self.assertEqual({}, load_yaml(MINIMAL).tools["echo"].annotations)
+
+    def test_unknown_annotation_key_is_error(self):
+        # 大文字小文字の typo が黙って捨てられないことがこの検査の主眼
+        with self.assertRaisesRegex(ConfigError, "unknown annotations keys"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: x\n'
+                '    argv: ["true"]\n'
+                '    annotations: {readonlyHint: true}\n'
+            )
+
+    def test_non_bool_hint_is_error(self):
+        with self.assertRaisesRegex(ConfigError, "annotations.readOnlyHint must be bool"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: x\n'
+                '    argv: ["true"]\n'
+                '    annotations: {readOnlyHint: "yes"}\n'
+            )
+
+    def test_non_str_title_is_error(self):
+        with self.assertRaisesRegex(ConfigError, "annotations.title must be str"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: x\n'
+                '    argv: ["true"]\n'
+                '    annotations: {title: 1}\n'
+            )
+
+    def test_annotations_not_mapping_is_error(self):
+        with self.assertRaisesRegex(ConfigError, "annotations must be a mapping"):
+            load_yaml(
+                'server: {name: t}\n'
+                'tools:\n'
+                '  - name: x\n'
+                '    argv: ["true"]\n'
+                '    annotations: [readOnlyHint]\n'
+            )
+
+    def test_defaults_merged_and_tool_wins(self):
+        spec = load_yaml(
+            'server: {name: t}\n'
+            'defaults:\n'
+            '  annotations: {readOnlyHint: true, openWorldHint: false}\n'
+            'tools:\n'
+            '  - {name: a, argv: ["true"]}\n'
+            '  - name: b\n'
+            '    argv: ["true"]\n'
+            '    annotations: {readOnlyHint: false, destructiveHint: true}\n'
+        )
+        self.assertEqual(
+            {"readOnlyHint": True, "openWorldHint": False}, spec.tools["a"].annotations,
+        )
+        self.assertEqual(
+            {"readOnlyHint": False, "openWorldHint": False, "destructiveHint": True},
+            spec.tools["b"].annotations,
+        )
+
+    def test_defaults_annotations_validated(self):
+        with self.assertRaisesRegex(ConfigError, "defaults.*unknown annotations keys"):
+            load_yaml(
+                'server: {name: t}\n'
+                'defaults:\n'
+                '  annotations: {destructive: true}\n'
+                'tools:\n'
+                '  - {name: x, argv: ["true"]}\n'
+            )
+
+    def test_title_in_defaults_is_error(self):
+        with self.assertRaisesRegex(ConfigError, "annotations.title is per-tool only"):
+            load_yaml(
+                'server: {name: t}\n'
+                'defaults:\n'
+                '  annotations: {title: Shared}\n'
+                'tools:\n'
+                '  - {name: x, argv: ["true"]}\n'
+            )
+
+
 class FileOutputDirConfigTest(unittest.TestCase):
     """config レベル file_output_dir (defaults / tool) と出力ルートの解決。"""
 

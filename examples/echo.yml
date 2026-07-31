@@ -6,6 +6,12 @@ server:
   name: echo-demo
   description: Minimal cli-wrap-mcp demo (echo / date).
 
+# Both tools only print; declaring it once here means the served tool list says so
+# (a client can then auto-approve read-only tools without enumerating them).
+defaults:
+  annotations:
+    readOnlyHint: true
+
 tools:
   - name: say
     description: Echo a message back.
