@@ -2,7 +2,6 @@
 
 実行: uv run pytest
 """
-import os
 import sys
 import tempfile
 import unittest
@@ -10,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from cli_wrap_mcp.jobs import JobManager
+from cli_wrap_mcp.runtime import INVOCATION_ID_RE, new_invocation_id
 from cli_wrap_mcp.spec import ParamValidationError, ToolSpec
 
 
@@ -104,15 +104,20 @@ class JobModeTest(unittest.TestCase):
         self.assertTrue(self.jobs.result(job_id, 1000).is_error)
 
     def test_result_of_signal_killed_job_is_error(self):
-        # 非ゼロ側のもう一方の境界: シグナル終了は exit code が負値になる
+        # 非ゼロ側のもう一方の境界: シグナル終了は exit code が負値になる。
+        # stderr tail は OOM kill / SIGSEGV での唯一の診断材料なので同時に固定する
         msg = self.jobs.start(
             self.tool,
-            [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"],
+            [sys.executable, "-c",
+             "import os, signal, sys; sys.stderr.write('job-diag'); sys.stderr.flush(); "
+             "os.kill(os.getpid(), signal.SIGKILL)"],
         ).text
         job_id = self.job_id_from(msg)
         _state, rc = self.wait_exit(job_id)
         self.assertEqual(-9, rc)
-        self.assertTrue(self.jobs.result(job_id, 1000).is_error)
+        reply = self.jobs.result(job_id, 1000)
+        self.assertIn("job-diag", reply.text)
+        self.assertTrue(reply.is_error)
 
     def test_result_of_successful_job_is_not_error(self):
         msg = self.jobs.start(self.tool, [sys.executable, "-c", "print('ok')"]).text
@@ -164,9 +169,12 @@ class JobModeTest(unittest.TestCase):
         self.assertFalse(reply.is_error)
 
     def test_cancel_when_process_already_gone_is_not_error(self):
-        # pid は読めるがプロセスが居ない → 要求どおり (止める対象が居ない)
-        job_id = self.orphan_job(str(self.unused_pid()))
-        reply = self.jobs.cancel(job_id)
+        # pid は読めるがプロセスが居ない → 要求どおり (止める対象が居ない)。
+        # 実 pid を推測して撃つと無関係なプロセスグループを止めうるので、
+        # killpg の結果だけを差し替えて経路を踏む
+        job_id = self.orphan_job("4000000")
+        with mock.patch("os.killpg", side_effect=ProcessLookupError()):
+            reply = self.jobs.cancel(job_id)
         self.assertIn("not running", reply.text)
         self.assertFalse(reply.is_error)
 
@@ -178,22 +186,11 @@ class JobModeTest(unittest.TestCase):
         self.assertTrue(reply.is_error)
 
     def test_cancel_when_signal_fails_is_error(self):
-        job_id = self.orphan_job(str(self.unused_pid()))
+        job_id = self.orphan_job("4000000")
         with mock.patch("os.killpg", side_effect=PermissionError("denied")):
             reply = self.jobs.cancel(job_id)
         self.assertIn("failed to terminate", reply.text)
         self.assertTrue(reply.is_error)
-
-    def unused_pid(self) -> int:
-        """生きていない pid を 1 つ返す (見つからなければテストを skip する)。"""
-        for pid in range(400_000, 400_200):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return pid
-            except OSError:
-                continue
-        self.skipTest("no unused pid found")
 
     # --- 未知 (unknown) 状態 -----------------------------------------------
 
@@ -211,6 +208,22 @@ class JobModeTest(unittest.TestCase):
         self.assertIn("unknown", reply.text)
         self.assertFalse(reply.is_error)
 
+    # --- 出力末尾の切り出し境界 -------------------------------------------
+
+    def exited_job(self, body: str) -> str:
+        """body を実行して終了した job を 1 つ作り、その job_id を返す。"""
+        job_id = self.job_id_from(self.jobs.start(self.tool, [sys.executable, "-c", body]).text)
+        self.wait_exit(job_id)
+        return job_id
+
+    def test_log_tail_exactly_at_limit_is_not_marked_truncated(self):
+        job_id = self.exited_job("import sys; sys.stdout.write('x' * 100)")
+        self.assertNotIn("(truncated)", self.jobs.result(job_id, 100).text)
+
+    def test_log_tail_one_byte_over_limit_is_marked_truncated(self):
+        job_id = self.exited_job("import sys; sys.stdout.write('x' * 101)")
+        self.assertIn("(truncated)", self.jobs.result(job_id, 100).text)
+
     # --- job_id インジェクション (パストラバーサル) 対策 -------------------
 
     def test_malformed_job_id_rejected(self):
@@ -221,6 +234,28 @@ class JobModeTest(unittest.TestCase):
     def test_unknown_but_wellformed_job_id_is_error(self):
         with self.assertRaisesRegex(ParamValidationError, "unknown job_id"):
             self.jobs.status("20260101T000000-abc123")
+
+    def test_job_id_with_traversal_suffix_rejected(self):
+        # 正しい形式の直後に付く接尾辞を弾くのは正規表現の末尾アンカーだけ。
+        # ここを緩めると job dir の外を指せるので、末尾側を明示的に固定する
+        for bad in (
+            "20260101T000000-abcdef/../../../../etc",
+            "20260101T000000-abcdef/x",
+            "20260101T000000-abcdef\n",
+            "20260101T000000-abcdefff",
+        ):
+            with self.assertRaisesRegex(ParamValidationError, "invalid job_id", msg=bad):
+                self.jobs.status(bad)
+
+    def test_job_id_length_is_exact(self):
+        # 境界: ランダム部は 6 桁ちょうど (5 桁でも 7 桁でも通さない)
+        for bad in ("20260101T000000-abcde", "20260101T000000-abcdef0"):
+            with self.assertRaisesRegex(ParamValidationError, "invalid job_id", msg=bad):
+                self.jobs.status(bad)
+
+    def test_generated_job_id_matches_validator(self):
+        # 生成側と検証側がずれると自前の job_id を弾く (runtime.py の宣言)
+        self.assertTrue(INVOCATION_ID_RE.fullmatch(new_invocation_id()))
 
 
 if __name__ == "__main__":

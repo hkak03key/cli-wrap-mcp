@@ -227,6 +227,21 @@ class StructuredContentShapeTest(unittest.TestCase):
         result = call_tool(server, "echo", {"msg": "hi"})
         self.assertEqual({SCALAR_RESULT_KEY: "hi\n"}, result.structuredContent)
 
+    def test_every_registered_tool_declares_the_same_output_schema(self):
+        # sync は exec 生成・job は module 定義と注釈の解決経路が違うので、
+        # 登録された全ツールを走査する (片方だけ落ちても気づけない形にしない)
+        import anyio
+
+        seen = 0
+        for yaml_text in (MINIMAL, JOB_YAML):
+            for tool in anyio.run(build_server(load_yaml(yaml_text)).list_tools):
+                seen += 1
+                self.assertIsNotNone(tool.outputSchema, tool.name)
+                self.assertEqual(
+                    [SCALAR_RESULT_KEY], list(tool.outputSchema["properties"]), tool.name,
+                )
+        self.assertEqual(5, seen, "sync 1 + job 4 の全ツールを走査していない")
+
 
 class OutputDirTest(unittest.TestCase):
     """全 sync ツールに自動注入される file_output_dir param の挙動。"""

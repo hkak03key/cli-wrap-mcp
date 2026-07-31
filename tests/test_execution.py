@@ -156,6 +156,46 @@ class FileOutputModeTest(unittest.TestCase):
         out = run_sync(tool, tool.argv, file_dir=None).text
         self.assertIn("output truncated at 100 bytes", out)
 
+class OutputBoundaryTest(unittest.TestCase):
+    """出力サイズの上限を「ちょうど」で検証する (超過だけでは off-by-one を素通しする)。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.file_dir = Path(self._tmp.name) / "outputs"
+
+    def emit(self, nbytes: int, limit: int, **kwargs) -> ToolSpec:
+        """stdout をちょうど nbytes 出すツールを組む (改行込み)。"""
+        return ToolSpec(
+            name="t", description="",
+            argv=[sys.executable, "-c", f"print('x' * {nbytes - 1})"],
+            inline_max_output_bytes=limit,
+            **kwargs,
+        )
+
+    def test_output_exactly_at_limit_is_not_truncated(self):
+        tool = self.emit(100, 100)
+        text = run_sync(tool, tool.argv).text
+        self.assertNotIn("truncated", text)
+        self.assertEqual(100, len(text))
+
+    def test_output_one_byte_over_limit_is_truncated(self):
+        tool = self.emit(101, 100)
+        self.assertIn("output truncated at 100 bytes", run_sync(tool, tool.argv).text)
+
+    def test_output_exactly_at_limit_stays_inline_when_spilling(self):
+        tool = self.emit(100, 100, inline_on_large_output="file")
+        text = run_sync(tool, tool.argv, file_dir=self.file_dir).text
+        self.assertNotIn("saved to file", text)
+        self.assertFalse(self.file_dir.exists())
+
+    def test_output_one_byte_over_limit_spills_to_file(self):
+        tool = self.emit(101, 100, inline_on_large_output="file")
+        text = run_sync(tool, tool.argv, file_dir=self.file_dir).text
+        self.assertIn("full output saved to file", text)
+        self.assertEqual(1, len(list(self.file_dir.iterdir())))
+
+
 class ErrorFlagTest(unittest.TestCase):
     """ラップ先の失敗が is_error に出ること (本文の文字列照合に頼らせない)。"""
 
