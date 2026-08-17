@@ -2,6 +2,7 @@
 
 実行: uv run pytest
 """
+import signal
 import sys
 import tempfile
 import unittest
@@ -72,7 +73,19 @@ class JobModeTest(unittest.TestCase):
         self.assertIn("SIGTERM", out)
         state, rc = self.wait_exit(job_id)
         self.assertEqual("exited", state)
-        self.assertNotEqual(0, rc)
+        self.assertEqual(-signal.SIGTERM, rc)  # 応答文ではなく実際に届いたシグナル
+
+    def test_cancel_sends_sigterm_to_the_process_group(self):
+        # 応答文の "SIGTERM" は固定文字列なので、送信側の引数を直接押さえる。
+        # 優雅な停止 (ラップ先のクリーンアップ) はツール description の公開契約
+        msg = self.jobs.start(self.tool, [sys.executable, "-c", "import time; time.sleep(30)"]).text
+        job_id = self.job_id_from(msg)
+        with mock.patch("os.killpg") as killpg:
+            self.jobs.cancel(job_id)
+        pid = int((self.jobs.jobs_dir / job_id / "pid").read_text())
+        killpg.assert_called_once_with(pid, signal.SIGTERM)
+        self.jobs.cancel(job_id)  # mock 下では実際には止まっていないので後始末
+        self.wait_exit(job_id)
 
     def test_nonzero_exit_result_includes_stderr(self):
         msg = self.jobs.start(
@@ -142,14 +155,31 @@ class JobModeTest(unittest.TestCase):
 
     # --- cancel の全経路 ---------------------------------------------------
 
-    def orphan_job(self, pid_text: str | None) -> str:
+    def orphan_job(self, pid_text: str | None, exit_code: str | None = None) -> str:
         """プロセスハンドルを持たない job dir を作る (サーバー再起動後の孤児を模す)。"""
         job_id = "20260101T000000-abcdef"
         jdir = self.jobs.jobs_dir / job_id
         jdir.mkdir(parents=True)
         if pid_text is not None:
             (jdir / "pid").write_text(pid_text, encoding="utf-8")
+        if exit_code is not None:
+            (jdir / "exit_code").write_text(exit_code, encoding="utf-8")
         return job_id
+
+    def test_orphan_job_with_recorded_exit_code_is_not_error(self):
+        # 孤児でも exit_code が残っていれば成否は確定する。unknown に倒すと
+        # 再起動後に成功した job が失敗として client に届く
+        job_id = self.orphan_job(None, exit_code="0")
+        self.assertEqual(("exited", 0), self.jobs._poll(job_id))
+        reply = self.jobs.result(job_id, 1000)
+        self.assertIn("exited (exit code 0)", reply.text)
+        self.assertFalse(reply.is_error)
+
+    def test_orphan_job_with_recorded_nonzero_exit_code_is_error(self):
+        job_id = self.orphan_job(None, exit_code="3")
+        reply = self.jobs.result(job_id, 1000)
+        self.assertIn("exited (exit code 3)", reply.text)
+        self.assertTrue(reply.is_error)
 
     def test_cancel_running_job_is_not_error(self):
         msg = self.jobs.start(self.tool, [sys.executable, "-c", "import time; time.sleep(30)"]).text
