@@ -13,7 +13,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from cli_wrap_mcp.runtime import INVOCATION_ID_RE, exec_env, new_invocation_id
-from cli_wrap_mcp.spec import STDERR_TAIL_BYTES, ParamValidationError, ToolSpec
+from cli_wrap_mcp.spec import (
+    STDERR_TAIL_BYTES,
+    ParamValidationError,
+    ToolReply,
+    ToolSpec,
+)
 
 
 def _tail_file(path: Path, limit: int) -> str:
@@ -50,12 +55,12 @@ class JobManager:
     def _job_dir(self, job_id: str) -> Path:
         """job_id を検証して job dir のパスを返す。"""
         # job_id は client 入力なので、パストラバーサルを形式検証で遮断する
-        if not INVOCATION_ID_RE.match(job_id):
+        if not INVOCATION_ID_RE.fullmatch(job_id):
             raise ParamValidationError(f"invalid job_id: {job_id!r}")
         return self.jobs_dir / job_id
 
-    def start(self, tool: ToolSpec, argv: list[str]) -> str:
-        """コマンドをバックグラウンド起動し、job_id と操作方法を返す。"""
+    def start(self, tool: ToolSpec, argv: list[str]) -> ToolReply:
+        """コマンドをバックグラウンド起動し、job_id と操作方法を返す (起動失敗は is_error)。"""
         job_id = new_invocation_id()
         jdir = self.jobs_dir / job_id
         jdir.mkdir(parents=True)
@@ -71,7 +76,9 @@ class JobManager:
                     env=exec_env(tool),
                 )
             except OSError as exc:
-                return f"error: failed to start {argv!r}: {exc}"
+                return ToolReply(
+                    f"error: failed to start {argv!r}: {exc}", is_error=True,
+                )
         (jdir / "pid").write_text(str(proc.pid), encoding="utf-8")
         meta = {
             "tool": tool.name,
@@ -82,7 +89,7 @@ class JobManager:
         (jdir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
         self._procs[job_id] = proc
         print(f"cliwrap: job {job_id} started: {argv!r}", file=sys.stderr)
-        return (
+        return ToolReply(
             f"job started: {job_id}\n"
             f"logs: {jdir}\n"
             f"use {tool.name}_status / {tool.name}_result / {tool.name}_cancel with this job_id"
@@ -113,8 +120,12 @@ class JobManager:
         except (OSError, ValueError):
             return "unknown", None
 
-    def status(self, job_id: str, tail_bytes: int = 2_000) -> str:
-        """job の状態と stdout/stderr の末尾を返す。"""
+    def status(self, job_id: str, tail_bytes: int = 2_000) -> ToolReply:
+        """job の状態と stdout/stderr の末尾を返す。
+
+        job 自体が失敗していても状態の問い合わせは成立しているので is_error は立てない
+        (ラップ先の成否を isError で受け取る地点は result である)。
+        """
         state, rc = self._poll(job_id)
         jdir = self._job_dir(job_id)
         lines = [f"job {job_id}: {state}" + (f" (exit code {rc})" if rc is not None else "")]
@@ -128,36 +139,54 @@ class JobManager:
         lines.append(f"stdout (tail):\n{stdout_tail or '(empty)'}")
         if stderr_tail:
             lines.append(f"stderr (tail):\n{stderr_tail}")
-        return "\n".join(lines)
+        return ToolReply("\n".join(lines))
 
-    def result(self, job_id: str, max_bytes: int) -> str:
-        """終了した job の出力 (末尾 max_bytes) を返す。実行中なら案内のみ返す。"""
+    def result(self, job_id: str, max_bytes: int) -> ToolReply:
+        """終了した job の出力 (末尾 max_bytes) を返す。実行中なら案内のみ返す。
+
+        result はラップ先の結末を client に届ける地点なので、非ゼロ終了は is_error を
+        立てる。exit code を確定できなかった unknown も、成功と伝えられない以上は
+        同じ扱いにする (実行中の案内は問い合わせとして成立しているので立てない)。
+        """
         state, rc = self._poll(job_id)
         if state == "running":
-            return f"job {job_id} is still running; try again later (or check _status)"
+            return ToolReply(
+                f"job {job_id} is still running; try again later (or check _status)"
+            )
         jdir = self._job_dir(job_id)
         header = f"job {job_id}: {state}" + (f" (exit code {rc})" if rc is not None else "")
         stdout = _tail_file(jdir / "stdout.log", max_bytes) or "(empty)"
         parts = [header, f"stdout:\n{stdout}"]
-        if rc not in (0, None):
+        # rc is None は state == "unknown" (exit code を確定できなかった) を意味する。
+        # stderr tail は失敗の要約として付けるが、unknown ではその失敗自体が未確定なので
+        # 付けない。一方 is_error は「成功と伝えられない」側に倒すので unknown も立てる
+        if rc is not None and rc != 0:
             parts.append(f"stderr (tail):\n{_tail_file(jdir / 'stderr.log', STDERR_TAIL_BYTES)}")
-        return "\n".join(parts)
+        return ToolReply("\n".join(parts), is_error=rc is None or rc != 0)
 
-    def cancel(self, job_id: str) -> str:
-        """実行中の job にプロセスグループごと SIGTERM を送る。"""
+    def cancel(self, job_id: str) -> ToolReply:
+        """実行中の job にプロセスグループごと SIGTERM を送る。
+
+        止める対象が既にいないこと (終了済み・プロセス消滅) は要求どおりの結末なので
+        is_error は立てない。pid を読めない・SIGTERM が届かない場合だけ失敗とする。
+        """
         state, rc = self._poll(job_id)
         if state == "exited":
-            return f"job {job_id} already exited (exit code {rc})"
+            return ToolReply(f"job {job_id} already exited (exit code {rc})")
         jdir = self._job_dir(job_id)
         try:
             pid = int((jdir / "pid").read_text())
         except (OSError, ValueError) as exc:
-            return f"error: cannot read pid for job {job_id}: {exc}"
+            return ToolReply(
+                f"error: cannot read pid for job {job_id}: {exc}", is_error=True,
+            )
         try:
             # start_new_session で起動しているので pid == pgid。グループごと止める
             os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
-            return f"job {job_id} is not running (process already gone)"
+            return ToolReply(f"job {job_id} is not running (process already gone)")
         except OSError as exc:
-            return f"error: failed to terminate job {job_id}: {exc}"
-        return f"job {job_id}: SIGTERM sent to process group {pid}"
+            return ToolReply(
+                f"error: failed to terminate job {job_id}: {exc}", is_error=True,
+            )
+        return ToolReply(f"job {job_id}: SIGTERM sent to process group {pid}")

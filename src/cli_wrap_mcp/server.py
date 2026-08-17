@@ -4,7 +4,10 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
+
+from mcp.server.fastmcp import FastMCP
+from mcp.types import CallToolResult, TextContent
 
 from cli_wrap_mcp.execution import run_sync
 from cli_wrap_mcp.jobs import JobManager
@@ -15,14 +18,48 @@ from cli_wrap_mcp.spec import (
     ConfigError,
     ParamValidationError,
     ServerSpec,
+    ToolReply,
     ToolSpec,
 )
+
+# FastMCP が scalar 戻り値を structuredContent へ包むときのキー。
+# 応答を CallToolResult として自前で組む以上この形も自前で再現する必要があり
+# (ズレると outputSchema 検証に落ちて ToolError になる)、値の正はここ 1 箇所に置く。
+# 実際の SDK 挙動との一致は test_server.StructuredContentShapeTest が機械検査する
+SCALAR_RESULT_KEY = "result"
+
+# ツール関数の戻り値注釈。FastMCP は Annotated[CallToolResult, X] の X から
+# outputSchema を推論しつつ、CallToolResult はそのまま client へ通す。応答本文の型は
+# str なので推論元は str、実際に返すのは isError を載せた CallToolResult になる
+ToolFnReturn = Annotated[CallToolResult, str]
 
 
 def default_cache_dir() -> Path:
     """出力ルート未指定時の既定 cache dir (CLI_MCP_CACHE_DIR で上書き可) を返す。"""
     env = os.environ.get("CLI_MCP_CACHE_DIR")
     return Path(env) if env else Path.home() / ".cache" / "cli-mcp"
+
+
+def _call_result(reply: ToolReply) -> CallToolResult:
+    """ToolReply を MCP の CallToolResult に変換する (失敗は isError で伝える)。
+
+    tool 関数が str を返すと SDK は必ず isError=false で包むため、失敗を伝える経路は
+    CallToolResult を自前で返すことになる。応答本文・outputSchema・structuredContent は
+    SDK に組ませたときと同一で、isError だけが成否を運ぶ。
+    """
+    return CallToolResult(
+        content=[TextContent(type="text", text=reply.text)],
+        structuredContent={SCALAR_RESULT_KEY: reply.text},
+        isError=reply.is_error,
+    )
+
+
+def _reply_to_result(call) -> CallToolResult:
+    """ToolReply を返す呼び出しを実行し、パラメータ検証エラーも失敗応答へ畳んで返す。"""
+    try:
+        return _call_result(call())
+    except ParamValidationError as exc:
+        return _call_result(ToolReply(f"error: {exc}", is_error=True))
 
 
 def _make_tool_fn(fn_name: str, tool: ToolSpec, invoke, inject_output_dir: bool = False):
@@ -47,19 +84,17 @@ def _make_tool_fn(fn_name: str, tool: ToolSpec, invoke, inject_output_dir: bool 
         optional_args.append("file_output_dir: str | None = None")
     signature = ", ".join(required_args + optional_args)
     src = (
-        f"def {fn_name}({signature}) -> str:\n"
+        f"def {fn_name}({signature}) -> ToolFnReturn:\n"
         f"    kwargs = dict(locals())\n"
         f"    return _invoke(kwargs)\n"
     )
-    namespace: dict[str, Any] = {"_invoke": invoke}
+    namespace: dict[str, Any] = {"_invoke": invoke, "ToolFnReturn": ToolFnReturn}
     exec(src, namespace)  # noqa: S102 - config は信頼済みローカルファイル
     return namespace[fn_name]
 
 
 def build_server(spec: ServerSpec, cache_dir: Path | None = None):
     """ServerSpec の全ツールを登録した FastMCP サーバーを返す。"""
-    from mcp.server.fastmcp import FastMCP
-
     mcp = FastMCP(spec.name, instructions=spec.description)
     server_cache_dir = (cache_dir or default_cache_dir()) / spec.name
     # 出力ルートは tool の file_output_dir (未指定は cache)。sync は <root>/outputs/、
@@ -83,19 +118,24 @@ def register_tool(
 ) -> None:
     """tool の mode に応じた MCP ツール (sync は 1 つ、job は 4 つ) を登録する。"""
     if tool.mode == "sync":
-        def invoke(arguments: dict[str, Any], _tool=tool) -> str:
-            call_dir_arg = arguments.pop("file_output_dir", None)
-            call_dir: Path | None = None
-            if call_dir_arg is not None:
-                if not str(call_dir_arg).startswith("/"):
-                    return "error: file_output_dir must be an absolute path (starting with '/')"
-                call_dir = Path(call_dir_arg)
-            try:
+        def invoke(arguments: dict[str, Any], _tool=tool) -> CallToolResult:
+            def run() -> ToolReply:
+                """予約 param を解決し argv を組み立てて同期実行する。"""
+                call_dir_arg = arguments.pop("file_output_dir", None)
+                call_dir: Path | None = None
+                if call_dir_arg is not None:
+                    if not str(call_dir_arg).startswith("/"):
+                        return ToolReply(
+                            "error: file_output_dir must be an absolute path "
+                            "(starting with '/')",
+                            is_error=True,
+                        )
+                    call_dir = Path(call_dir_arg)
                 argv = render_argv(_tool, arguments)
-            except ParamValidationError as exc:
-                return f"error: {exc}"
-            print(f"cliwrap: exec {argv!r}", file=sys.stderr)
-            return run_sync(_tool, argv, file_dir=file_dir, call_dir=call_dir)
+                print(f"cliwrap: exec {argv!r}", file=sys.stderr)
+                return run_sync(_tool, argv, file_dir=file_dir, call_dir=call_dir)
+
+            return _reply_to_result(run)
 
         fn = _make_tool_fn(f"tool_{tool.name}", tool, invoke, inject_output_dir=True)
         description = (
@@ -115,32 +155,22 @@ def register_tool(
 def register_job_tool(mcp, tool: ToolSpec, jobs: JobManager) -> None:
     """job モードのツール一式 (<name>_start/_status/_result/_cancel) を登録する。"""
 
-    def invoke_start(arguments: dict[str, Any], _tool=tool) -> str:
-        try:
-            argv = render_argv(_tool, arguments)
-        except ParamValidationError as exc:
-            return f"error: {exc}"
-        return jobs.start(_tool, argv)
+    def invoke_start(arguments: dict[str, Any], _tool=tool) -> CallToolResult:
+        return _reply_to_result(lambda: jobs.start(_tool, render_argv(_tool, arguments)))
 
     start_fn = _make_tool_fn(f"tool_{tool.name}_start", tool, invoke_start)
 
-    def status_fn(job_id: str) -> str:
-        try:
-            return jobs.status(job_id)
-        except ParamValidationError as exc:
-            return f"error: {exc}"
+    def status_fn(job_id: str) -> ToolFnReturn:
+        """job の状態を問い合わせる。"""
+        return _reply_to_result(lambda: jobs.status(job_id))
 
-    def result_fn(job_id: str) -> str:
-        try:
-            return jobs.result(job_id, tool.inline_max_output_bytes)
-        except ParamValidationError as exc:
-            return f"error: {exc}"
+    def result_fn(job_id: str) -> ToolFnReturn:
+        """終了した job の出力を取得する。"""
+        return _reply_to_result(lambda: jobs.result(job_id, tool.inline_max_output_bytes))
 
-    def cancel_fn(job_id: str) -> str:
-        try:
-            return jobs.cancel(job_id)
-        except ParamValidationError as exc:
-            return f"error: {exc}"
+    def cancel_fn(job_id: str) -> ToolFnReturn:
+        """実行中の job を停止する。"""
+        return _reply_to_result(lambda: jobs.cancel(job_id))
 
     # 公開名は spec.JOB_TOOL_SUFFIXES から導出する (config のロード時衝突検査と同じ一覧)
     handlers = {

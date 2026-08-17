@@ -225,6 +225,37 @@ Job logs and metadata persist under `<root>/jobs/` (the tool's `file_output_dir`
 or the cache dir), so finished jobs remain inspectable (best-effort) even across
 server restarts. See [`examples/sleep-job.yml`](examples/sleep-job.yml).
 
+## Error reporting
+
+Failures are reported with `isError: true` on the `CallToolResult`, so a client can
+branch on the protocol field instead of pattern-matching the response text. The text
+itself is unchanged — a wrapped CLI that legitimately prints `error: ...` on a
+successful run is still `isError: false`.
+
+`isError: true` is set when:
+
+- the wrapped command exits non-zero, times out, or cannot be started. A process
+  killed by a signal reports a negative exit code (`-9` for SIGKILL, `-11` for
+  SIGSEGV) and counts as non-zero.
+- a parameter fails validation, the reserved `file_output_dir` parameter is not an
+  absolute path, or a `job_id` is malformed or unknown — the `job_id` check applies
+  to every job tool, `<name>_status` and `<name>_cancel` included.
+- writing the audit trail fails. That means the two paths that write the full output
+  by request: `output_mode: file`, and a call that passes the reserved
+  `file_output_dir` parameter. The opportunistic file output of
+  `inline_on_large_output: file` is exempt — it falls back to truncating inline, so
+  the call still succeeds.
+- `<name>_cancel` cannot read the job's pid, or fails to deliver SIGTERM.
+- `<name>_result` is fetched for a job that exited non-zero, or whose exit code
+  could not be determined.
+
+Otherwise a job tool reports its observation and stays `isError: false` — the query
+itself succeeded. That covers `<name>_status` for a job that failed, `<name>_result`
+on a still-running job, and `<name>_cancel` when the process had already exited or
+was already gone. A job killed by the SIGTERM that `<name>_cancel` sends exits with a
+negative code, so its `<name>_result` is an error; a job that traps SIGTERM and exits
+0 is not.
+
 ## Development
 
 ```sh
