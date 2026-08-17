@@ -10,8 +10,9 @@ def call_tool(server, name: str, arguments: dict | None = None):
     """in-memory client 経由でツールを呼び、client が受け取る CallToolResult を返す。
 
     isError は本来 client が受け取る側の値なので、FastMCP の戻り値を直接見るのではなく
-    プロトコル境界を実際に通した結果を検査する (outputSchema 検証など、境界越しでしか
-    働かない SDK の処理も一緒に通す)。
+    プロトコル境界を実際に通した結果を検査する。ツール関数から送出された例外を
+    isError の応答へ畳むのは境界 (lowlevel server) だけなので、直接呼びでは例外が
+    そのまま出てしまい client の見え方を確かめられない。
     """
     import anyio
     from mcp.shared.memory import create_connected_server_and_client_session
