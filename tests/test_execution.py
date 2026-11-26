@@ -36,6 +36,47 @@ class RunSyncTest(unittest.TestCase):
         self.assertIn("exited with code 3", out)
         self.assertIn("boom", out)
 
+    def test_nonzero_exit_also_returns_stdout_tail(self):
+        # 失敗の要約や結果ファイルのパスを stdout の最後に出す CLI のため、
+        # 失敗時も stdout の末尾を返す (以前は stderr だけで stdout は捨てていた)
+        tool = self.tool(
+            [sys.executable, "-c",
+             "import sys; print('log line'); print('result: /tmp/r.json'); "
+             "sys.stderr.write('boom'); sys.exit(1)"],
+        )
+        out = run_sync(tool, tool.argv)
+        self.assertIn("exited with code 1", out)
+        self.assertIn("stdout (tail):\nlog line\nresult: /tmp/r.json", out)
+        self.assertIn("stderr (tail):\nboom", out)
+        self.assertLess(out.index("stdout (tail)"), out.index("stderr (tail)"))
+
+    def test_nonzero_exit_stdout_tail_keeps_the_end(self):
+        tool = self.tool(
+            [sys.executable, "-c",
+             "import sys; print('x' * 1000); print('THE-END'); sys.exit(1)"],
+            inline_max_output_bytes=100,
+        )
+        out = run_sync(tool, tool.argv)
+        self.assertIn("THE-END", out)
+        self.assertIn("stdout truncated to its last 100 bytes", out)
+        self.assertLess(len(out), 400)
+
+    def test_nonzero_exit_without_stdout_has_no_stdout_section(self):
+        tool = self.tool(
+            [sys.executable, "-c", "import sys; sys.stderr.write('boom'); sys.exit(3)"],
+        )
+        self.assertNotIn("stdout (tail)", run_sync(tool, tool.argv))
+
+    def test_timeout_returns_output_so_far(self):
+        tool = self.tool(
+            [sys.executable, "-c",
+             "import sys, time; print('started', flush=True); time.sleep(5)"],
+            timeout_sec=1,
+        )
+        out = run_sync(tool, tool.argv)
+        self.assertIn("timed out after 1s", out)
+        self.assertIn("stdout (tail):\nstarted", out)
+
     def test_timeout_returns_error(self):
         tool = self.tool(
             [sys.executable, "-c", "import time; time.sleep(5)"], timeout_sec=1,
@@ -104,6 +145,7 @@ class FileOutputModeTest(unittest.TestCase):
         self.assertIn("exited with code 3", out)
         self.assertIn("output saved to:", out)
         self.assertIn("boom", out)
+        self.assertIn("stdout (tail):\npartial", out)
         dirs = list(self.file_dir.iterdir())
         self.assertEqual(1, len(dirs))  # 失敗した実行も証跡が残る
         self.assertEqual(b"partial\n", (dirs[0] / "stdout.log").read_bytes())

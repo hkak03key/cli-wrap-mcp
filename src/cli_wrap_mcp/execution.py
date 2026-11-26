@@ -86,6 +86,31 @@ def _stderr_tail(stderr: bytes) -> str:
     return stderr[-STDERR_TAIL_BYTES:].decode("utf-8", errors="replace")
 
 
+def _stdout_tail(stdout: bytes, limit: int) -> str:
+    """失敗時に返す stdout の末尾 (limit バイト) をテキストで返す。
+
+    多くの CLI は失敗の要約や結果ファイルのパスを stdout の最後に出すため、
+    先頭ではなく末尾を残す。切り詰めた場合は先頭に注記を付ける。
+    """
+    if len(stdout) <= limit:
+        return stdout.decode("utf-8", errors="replace")
+    tail = stdout[-limit:].decode("utf-8", errors="replace")
+    return f"[cliwrap: stdout truncated to its last {limit} bytes (total {len(stdout)} bytes)]\n{tail}"
+
+
+def _failure_output(stdout: bytes, stderr: bytes, stdout_limit: int) -> str:
+    """失敗 (非 0 終了・timeout) の応答に付ける stdout / stderr の末尾。
+
+    stdout が空なら stderr だけ。stdout を捨てると、出力を stdout に書く
+    CLI では失敗の理由が呼び出し側に届かない。
+    """
+    parts = []
+    if stdout:
+        parts.append(f"stdout (tail):\n{_stdout_tail(stdout, stdout_limit)}")
+    parts.append(f"stderr (tail):\n{_stderr_tail(stderr)}")
+    return "\n".join(parts)
+
+
 def run_sync(
     tool: ToolSpec,
     argv: list[str],
@@ -109,6 +134,12 @@ def run_sync(
         )
     except subprocess.TimeoutExpired as exc:
         msg = f"error: command timed out after {tool.timeout_sec}s: {argv!r}"
+        if exc.stdout or exc.stderr:
+            # timeout までに出ていた出力の末尾 (どこで止まったかの手掛かり)
+            msg += "\n" + _failure_output(
+                exc.stdout or b"", exc.stderr or b"",
+                FILE_EXCERPT_BYTES if dest is not None else tool.inline_max_output_bytes,
+            )
         if dest is not None:
             # timeout でも捕捉済みの部分出力を best-effort で証跡に残す
             meta = _invocation_meta(tool, argv, started_at, None, timed_out=True)
@@ -132,13 +163,13 @@ def run_sync(
             return (
                 f"error: command exited with code {proc.returncode}\n"
                 f"output saved to: {inv_dir}\n"
-                f"stderr (tail):\n{_stderr_tail(proc.stderr)}"
+                + _failure_output(proc.stdout, proc.stderr, FILE_EXCERPT_BYTES)
             )
         return _file_reply(proc.stdout, inv_dir)
     if proc.returncode != 0:
         return (
             f"error: command exited with code {proc.returncode}\n"
-            f"stderr (tail):\n{_stderr_tail(proc.stderr)}"
+            + _failure_output(proc.stdout, proc.stderr, tool.inline_max_output_bytes)
         )
     if (
         len(proc.stdout) > tool.inline_max_output_bytes
